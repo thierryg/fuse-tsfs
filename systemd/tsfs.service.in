@@ -1,0 +1,54 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : systemd/tsfs.service.in
+# Purpose : systemd unit template of the TSFS daemon (configured by CMake/Packaging.cmake)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Installed disabled: review @TSFS_CONFIG_PATH@ first (it ships with
+# garbage_collector.dry_run: true), then: systemctl enable --now tsfs.service
+#
+# Why the sandboxing is limited: ProtectSystem=, ProtectHome=, PrivateTmp=,
+# PrivateDevices= and similar options run the service in a private mount namespace;
+# a FUSE mount created there would be invisible to the rest of the system. The unit
+# keeps the options that do not create a mount namespace.
+[Unit]
+Description=TSFS time-aware storage filesystem (retention policies and garbage collector)
+Documentation=man:tsfs(1) file://@TSFS_INSTALL_FULL_DOCDIR@/README.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# Foreground: systemd supervises the process; SIGTERM unmounts cleanly.
+ExecStart=@TSFS_INSTALL_FULL_BINDIR@/tsfs --config @TSFS_CONFIG_PATH@ --foreground
+# Re-reads the configuration without remounting (the daemon also watches the file).
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# Default locations of the example configuration (logs, crash reports, data).
+StateDirectory=tsfs
+StateDirectoryMode=0700
+LogsDirectory=tsfs
+LogsDirectoryMode=0750
+UMask=0027
+# Root is needed to mount without fusermount3 and to keep the ownership of the
+# files created through the mount; the bounding set is reduced to what that uses.
+# (no CAP_MKNOD: device nodes are refused; no CAP_SETFCAP: no xattr support)
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+# No LimitCORE=: systemd's default (soft 0, hard infinity) lets the daemon raise the
+# soft limit itself when diagnostics.native_core_dump is enabled, and only then.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

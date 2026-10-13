@@ -1,0 +1,30 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .editorconfig
+# Purpose : Shared editor settings
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.sh]
+indent_size = 2
+
+[*.{cmake,txt}]
+indent_size = 4
+
+[*.md]
+trim_trailing_whitespace = false

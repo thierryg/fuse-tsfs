@@ -1,0 +1,38 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : docker/Dockerfile.dev
+# Purpose : Reproducible C++26 development image (Ubuntu 26.04: GCC 15/16, Clang 21, libfuse 3.18)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Every package comes from the Ubuntu archive: the image needs no download script.
+# The FUSE integration tests need the container to be started with
+#   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined
+# which scripts/tsfs-dev.sh does.
+FROM ubuntu:26.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential g++ g++-16 clang clang-tidy clang-format lld \
+        cmake ninja-build pkg-config ccache git ca-certificates \
+        libfuse3-dev fuse3 libyaml-cpp-dev libspdlog-dev libfmt-dev zlib1g-dev \
+        libgtest-dev libgmock-dev libbenchmark-dev \
+        lcov gcovr doxygen graphviz gdb cppcheck python3 \
+        shellcheck procps psmisc file util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root developer account whose uid/gid match the host user (set by tsfs-dev.sh),
+# so that build artifacts in the bind-mounted tree keep the host ownership.
+ARG UID=1000
+ARG GID=1000
+# The base image has a "ubuntu" account at uid 1000: remove it first (userdel also
+# removes its private group), then create the group and the account.
+RUN (getent passwd "${UID}" >/dev/null && userdel -r "$(getent passwd "${UID}" | cut -d: -f1)" 2>/dev/null || true) \
+    && (getent group "${GID}" >/dev/null || groupadd -g "${GID}" dev) \
+    && useradd -m -u "${UID}" -g "${GID}" -s /bin/bash dev \
+    && echo user_allow_other >> /etc/fuse.conf
+
+USER dev
+WORKDIR /src

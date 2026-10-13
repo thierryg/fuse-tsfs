@@ -1,0 +1,13 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : benchmarks/.clang-tidy
+# Purpose : Benchmark-specific clang-tidy adjustments (inherits ../.clang-tidy)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# "for (auto _ : state)" is the Google Benchmark loop idiom: the iteration value is
+# intentionally unused, which the dead-store analysis reports on every benchmark.
+InheritParentConfig: true
+Checks: '-clang-analyzer-deadcode.DeadStores'

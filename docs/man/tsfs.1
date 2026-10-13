@@ -1,0 +1,424 @@
+.\" =============================================================================
+.\" TSFS - Time-aware Storage Filesystem for Linux
+.\" =============================================================================
+.\" File    : docs/man/tsfs.1
+.\" Purpose : Manual page of the tsfs daemon and command-line tool (section 1)
+.\" Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+.\" Project : tsfs (version: VERSION)
+.\" Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+.\" =============================================================================
+.TH TSFS 1 2026-10-13 "tsfs" "User Commands"
+.SH NAME
+tsfs \- time-aware storage filesystem: FUSE mount with retention policies and a garbage collector
+.SH SYNOPSIS
+.SY tsfs
+.RB [ \-c
+.IR path ]
+.RB [ \-m
+.IR path ]
+.RB [ \-b
+.IR path ]
+.RB [ \-l
+.IR level ]
+.RB [ \-f ]
+.RB [ \-d ]
+.RB [ \-\-fuse\-debug ]
+.RB [ \-\-stack\-trace | \-\-no\-stack\-trace ]
+.RB [ \-\-core\-dump | \-\-no\-core\-dump ]
+.YS
+.SY tsfs
+.RB [ \-c
+.IR path ]
+.RB [ \-m
+.IR path ]
+.RB [ \-b
+.IR path ]
+.RB [ \-l
+.IR level ]
+.B \-\-check\-config
+|
+.B \-\-show\-config
+|
+.B \-\-dry\-run
+|
+.B \-\-status
+.YS
+.SY tsfs
+.B \-\-print\-example\-config
+|
+.B \-V
+|
+.B \-h
+.YS
+.SH DESCRIPTION
+.B tsfs
+mounts a directory through FUSE and deletes files once their retention period has
+elapsed, according to the rules of the configuration file.
+.PP
+The
+.I backing directory
+.RB ( filesystem.backing_directory )
+is exposed unchanged at the
+.I mount point
+.RB ( filesystem.mountpoint ).
+Applications use the mount point as an ordinary filesystem.
+A built-in garbage collector evaluates every regular file against the retention
+rules: a file expires at its modification time (or, optionally, its creation time)
+plus the retention of the rule that matches it, and is deleted once expired.
+Exclusion rules protect files absolutely; files matched by no rule follow
+.BR retention.default ,
+which is
+.B never
+unless configured otherwise.
+.PP
+Before each deletion, the file is validated again under a path lock: it must still
+be the same regular file, inside the backing directory, not open through the mount,
+and still expired under the current policy.
+Directories, symbolic links and special files are never deleted.
+.PP
+With
+.B security.stay_on_filesystem
+(the default), entries on another filesystem than the backing directory (mount
+points or bind-mounted files below it) are not reachable through the mount: the
+operation fails with
+.BR EXDEV .
+A bind mount of the same filesystem is only detected for intermediate path
+components, and only with
+.BR openat2 (2);
+set
+.B security.require_openat2
+where this matters.
+New entries get the mode requested by the application after its own umask: the
+daemon resets its umask to 0 at startup.
+.PP
+Without an action option,
+.B tsfs
+mounts the filesystem and runs as a daemon (in the background unless
+.B \-f
+or
+.B \-d
+is given) until it is unmounted or receives
+.B SIGTERM
+or
+.BR SIGINT .
+The configuration is reloaded without remounting on
+.B SIGHUP
+and when the configuration file changes.
+.PP
+Paths in retention rules are relative to the TSFS root:
+.I /tmp/record
+designates
+.IR <backing_directory>/tmp/record .
+The configuration format is described in
+.IR configuration.md ,
+installed with the documentation.
+.SH OPTIONS
+.SS Actions
+At most one action may be given; the default action mounts and runs the filesystem.
+.TP
+.B \-\-check\-config
+Validate the configuration and exit (0 = valid, 5 = invalid).
+.TP
+.B \-\-show\-config
+Print the effective configuration (defaults included) and exit.
+.TP
+.B \-\-dry\-run
+Scan the backing directory once, list the files that would be deleted now (same
+checks as the real GC, except files open through a running mount, unknown here),
+delete nothing, exit.
+No mount is needed, and a running daemon is not affected.
+When more files expire than
+.B garbage_collector.max_pending_tasks
+can hold, the list is incomplete and the summary line says so:
+.RI "dry run: INCOMPLETE: " N " expiring file(s) did not fit in garbage_collector.max_pending_tasks (" X ") ..."
+Raise that setting to list them all.
+.TP
+.B \-\-status
+Print the status file of the running daemon
+.RB ( metrics.status_file ).
+.TP
+.B \-\-print\-example\-config
+Print the commented example configuration.
+.TP
+.BR \-V ", " \-\-version
+Print version information.
+.TP
+.BR \-h ", " \-\-help
+Print this help.
+.SS Configuration
+.TP
+.BR \-c ", " \-\-config " \fIpath\fR"
+Configuration file (default:
+.IR /etc/tsfs/config.yml ).
+It must be a regular file (a symbolic link is followed and its target is checked).
+When the effective user is root, it must also be owned by root and not writable by
+its group or by others (fix with
+.BR "chmod go\-w" );
+otherwise
+.B tsfs
+exits with status 5.
+.TP
+.BR \-m ", " \-\-mountpoint " \fIpath\fR"
+Override
+.BR filesystem.mountpoint .
+.TP
+.BR \-b ", " \-\-backing\-dir " \fIpath\fR"
+Override
+.BR filesystem.backing_directory .
+.PP
+The
+.B \-m
+and
+.B \-b
+values are normalized and validated like the values of the file (absolute, not
+.IR / ,
+not containing each other, not containing the log directory, the crash directory
+or the status file); an invalid value exits with status 5 and a message starting
+with
+.IR "command line:" .
+.TP
+.BR \-l ", " \-\-log\-level " \fIlevel\fR"
+Override
+.B logging.level
+.RB ( trace ", " debug ", " info ", " warning ", " error ", " critical ).
+.SS Running (default action only)
+These options only apply when mounting: combined with an action, they are rejected
+with status 2.
+.TP
+.BR \-f ", " \-\-foreground
+Do not detach from the terminal.
+.TP
+.BR \-d ", " \-\-debug
+Foreground, log level debug, log also to stderr.
+.TP
+.B \-\-fuse\-debug
+Print every FUSE request (libfuse
+.BR \-d ,
+implies
+.BR \-\-foreground ).
+.TP
+.B \-\-stack\-trace
+Enable diagnostics with text crash reports.
+.TP
+.B \-\-no\-stack\-trace
+Disable text crash reports.
+.TP
+.B \-\-core\-dump
+Enable diagnostics with native core dumps.
+.TP
+.B \-\-no\-core\-dump
+Do not change the core-dump limits.
+.PP
+Command-line values override the file for the whole life of the process,
+including after a reload (SIGHUP or file change).
+.SH SIGNALS
+.TP
+.B SIGHUP
+Reload the configuration file without remounting
+.RB ( "systemctl reload tsfs"
+sends it).
+The new file is validated first; if it is invalid, the reload is rejected
+.RB ( config_reload_failed )
+and the running configuration stays active.
+Changes to
+.BR filesystem.* ", " diagnostics.* " and " security.*
+require a restart and are reported, not applied.
+The file is also watched with inotify, so saving it triggers the same reload.
+.TP
+.B SIGUSR1
+Write the status file immediately and log a
+.B status_requested
+summary.
+.TP
+.BR SIGTERM ", " SIGINT
+Stop the garbage collector, write a final status file, unmount the filesystem and
+exit with status 0.
+Unmounting the mount point externally
+.RB ( umount ", " "fusermount3 \-u" )
+has the same effect.
+.SH FILES
+.TP
+.I /etc/tsfs/config.yml
+Default configuration file (the build option
+.B TSFS_DEFAULT_CONFIG_PATH
+may change it).
+Created from the example at installation only when absent; the example sets
+.BR "garbage_collector.dry_run: true" .
+.TP
+.I /etc/tsfs/NAME.yml
+Configuration of the TSFS filesystem
+.IR NAME ,
+served by the systemd template unit
+.BR tsfs@NAME.service
+(one daemon, one mount point and one backing directory per file).
+.TP
+.IR /lib/systemd/system/tsfs.service ", " tsfs@.service
+systemd units (installation prefix dependent, e.g.
+.IR /usr/local/lib/systemd/system ):
+the first serves
+.IR /etc/tsfs/config.yml ,
+the template one filesystem per
+.IR /etc/tsfs/NAME.yml .
+.TP
+.I /usr/local/share/doc/tsfs/examples/config.example.yml
+Commented example configuration (also printed by
+.BR \-\-print\-example\-config ).
+.TP
+.I /var/lib/tsfs/data
+Default backing directory: the managed files are stored here.
+It must exist before mounting.
+.TP
+.I /var/lib/tsfs/crash
+Default directory of the text crash reports
+.RI ( tsfs\-crash\- <time> \- <pid> .txt ,
+mode 0600), when
+.B diagnostics.enabled
+is true.
+A report holds the signal, the raw backtrace, a backtrace symbolized at crash time
+(function+offset and module, from the faulting frame) and the memory map; the same
+symbolized backtrace is printed on stderr.
+File and line numbers are resolved offline with
+.B scripts/tsfs\-symbolize.sh
+from the source tree, with the same build.
+.TP
+.I /mnt/tsfs
+Default mount point.
+It must exist before mounting.
+.TP
+.I /var/log/tsfs/tsfs.log
+Default log file, rotated to
+.IR tsfs.log.1 " ... " tsfs.log.N
+(optionally
+.IR .gz ).
+.TP
+.I /run/tsfs/status.json
+Default status file
+.RB ( metrics.status_file ),
+a JSON document rewritten periodically, on
+.BR SIGUSR1 ,
+and at shutdown.
+.TP
+.I tsfs.service
+systemd unit (installed disabled) that runs
+.B "tsfs \-\-config /etc/tsfs/config.yml \-\-foreground"
+and reloads with
+.BR SIGHUP .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Runtime error.
+.TP
+.B 2
+Usage error (unknown option, incompatible options).
+.TP
+.B 3
+Insufficient privileges:
+.I /dev/fuse
+is not accessible, or
+.B filesystem.allow_other
+is set for a non-root daemon without
+.B user_allow_other
+in
+.IR /etc/fuse.conf .
+.TP
+.B 4
+Missing dependency (for example
+.I /dev/fuse
+does not exist, or
+.B security.require_openat2
+on a kernel without
+.BR openat2 (2)).
+.TP
+.B 5
+Invalid configuration (including a missing configuration file, a configuration
+file a root daemon does not trust, and invalid
+.BR \-m / \-b
+values).
+.TP
+.B 7
+Unexpected system state (missing backing directory or mount point, unwritable log
+file, mount failure, no status file for
+.BR \-\-status ).
+.SH EXAMPLES
+Validate a configuration and print it with every default:
+.PP
+.in +4n
+.EX
+tsfs \-\-check\-config \-c /etc/tsfs/config.yml
+tsfs \-\-show\-config \-c /etc/tsfs/config.yml
+.EE
+.in
+.PP
+List the files the policy would delete now, without deleting anything:
+.PP
+.in +4n
+.EX
+sudo tsfs \-\-dry\-run \-c /etc/tsfs/config.yml
+.EE
+.in
+.PP
+A rule that deletes temporary recordings one day after their last modification,
+with an exception for one directory:
+.PP
+.in +4n
+.EX
+version: 1
+retention:
+  default: "never"
+  rules:
+    \- id: temporary\-recordings
+      path: "/tmp/record"
+      recursive: true
+      retention: "1d"
+    \- id: keep\-important\-recordings
+      action: "exclude"
+      path: "/tmp/record/keep"
+      recursive: true
+.EE
+.in
+.PP
+Mount in the foreground with debug logging on stderr:
+.PP
+.in +4n
+.EX
+sudo tsfs \-c /etc/tsfs/config.yml \-d
+.EE
+.in
+.PP
+Run as a service, reload after editing the configuration, read the status:
+.PP
+.in +4n
+.EX
+sudo systemctl enable \-\-now tsfs.service
+sudo systemctl reload tsfs
+sudo tsfs \-\-status
+.EE
+.in
+.PP
+Unmount:
+.PP
+.in +4n
+.EX
+sudo systemctl stop tsfs        # or: sudo umount /mnt/tsfs
+.EE
+.in
+.SH SEE ALSO
+.BR fusermount3 (1),
+.BR mount.fuse3 (8),
+.BR systemctl (1),
+.BR coredumpctl (1),
+.BR inotify (7),
+.BR openat2 (2),
+.BR statx (2).
+.PP
+The user guide
+.RI ( user\-guide.md ),
+the configuration reference
+.RI ( configuration.md )
+and the monitoring guide
+.RI ( monitoring.md ),
+installed in the TSFS documentation directory (by default
+.IR /usr/local/share/doc/tsfs/user/ ).

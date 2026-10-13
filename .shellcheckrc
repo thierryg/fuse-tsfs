@@ -1,0 +1,11 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .shellcheckrc
+# Purpose : shellcheck settings: follow the sourced scripts/lib/tsfs-common.sh
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+external-sources=true
+source-path=SCRIPTDIR

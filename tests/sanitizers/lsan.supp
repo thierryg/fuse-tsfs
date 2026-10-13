@@ -1,0 +1,14 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : tests/sanitizers/lsan.supp
+# Purpose : LeakSanitizer suppressions (third-party code only)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Format: "leak:<function, file or library pattern>", one per line.
+# Rule: never suppress a TSFS symbol; a leak in src/ is a defect to fix. Each entry
+# must name the library and the reason (with a reference when possible).
+#
+# (no suppression needed as of 2026-10-13)

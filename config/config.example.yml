@@ -1,0 +1,150 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : config/config.example.yml
+# Purpose : Commented example covering every supported option (schema version 1)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Copy to /etc/tsfs/config.yml and adapt. Validate before use:
+#   tsfs --config /etc/tsfs/config.yml --check-config
+#   tsfs --config /etc/tsfs/config.yml --dry-run      # what would be deleted now
+#
+# Every key is optional except "version". Unknown keys are rejected (a typo never
+# silently disables a setting). Values shown are examples; defaults are listed in
+# docs/user/configuration.md and printed by "tsfs --show-config".
+#
+# Units:
+#   durations  <n>ms <n>s <n>m <n>h <n>d <n>w, combinable from largest to smallest:
+#              "90s", "30m", "1d12h". No fractions, no spaces.
+#   sizes      B, KiB, MiB, GiB, TiB (powers of 1024) or KB, MB, GB, TB (powers of 1000).
+#
+# Paths in retention rules are relative to the TSFS root: "/tmp/record" means
+# "<backing_directory>/tmp/record", seen as "<mountpoint>/tmp/record". They never
+# designate host paths.
+
+version: 1
+
+filesystem:
+  # Where the filesystem is mounted, and the directory it exposes (passthrough).
+  # Restart required to change. They must not contain each other.
+  mountpoint: "/mnt/tsfs"
+  backing_directory: "/var/lib/tsfs/data"
+  mode: "passthrough"          # the only implemented mode
+  allow_other: false           # let other users access the mount (needs user_allow_other
+                               # in /etc/fuse.conf when not running as root)
+  read_only: false             # mount read-only (the GC still deletes expired files)
+
+retention:
+  # Lifetime of files matched by no rule. "never" (the default) keeps them forever.
+  default: "never"
+  # Start of a file's lifetime: "modification" (st_mtime, default) or "birth"
+  # (creation time from statx(); falls back to st_mtime where the filesystem has none).
+  timestamp: "modification"
+
+  # Precedence: an enabled "exclude" rule that matches always wins. Otherwise the
+  # matching rule with the highest priority wins, then the most specific scope
+  # (file > path_glob > path, deeper first, non-recursive first), then the most
+  # specific pattern, then the declaration order. See docs/architecture/policy-engine.md.
+  rules:
+    # Video recordings under /tmp/record (and below): one day.
+    - id: temporary-recordings
+      path: "/tmp/record"
+      recursive: true
+      retention: "1d"
+
+    # Every MP4 file anywhere: one day. "extension" is case-insensitive.
+    - id: video-files
+      extension: "mp4"
+      retention: "1d"
+
+    # Temporary cache: thirty minutes after the last modification.
+    - id: temporary-cache
+      path: "/var/cache/tsfs"
+      recursive: true
+      retention: "30m"
+
+    # Application logs: seven days.
+    - id: application-logs
+      path: "/var/log/application"
+      recursive: true
+      retention: "7d"
+
+    # Core dumps anywhere: two days. "glob" matches the file name only and is
+    # case-sensitive; "*" also matches names starting with a dot.
+    - id: core-dumps
+      glob: "*.core"
+      retention: "2d"
+
+    # Session directories: twelve hours, measured from the creation time.
+    - id: sessions
+      path_glob: "/sessions/session-*/**"
+      retention: "12h"
+      timestamp: "birth"
+
+    # Directory-specific exception: never delete anything under /tmp/record/keep.
+    - id: keep-important-recordings
+      action: "exclude"
+      path: "/tmp/record/keep"
+      recursive: true
+
+    # A disabled rule is ignored (kept here for later use).
+    - id: archived-exports
+      enabled: false
+      path: "/exports"
+      recursive: true
+      extension: ["csv", "tar.gz"]
+      retention: "30d"
+      priority: 10
+
+garbage_collector:
+  enabled: true
+  dry_run: true                  # log what would be deleted, delete nothing
+  scan_interval: "60s"           # time between two reconciliation passes
+  max_scan_duration: "5s"        # a pass is split into slices of at most this duration
+  max_workers: 2                 # deletion threads (1..64)
+  max_deletions_per_second: 100  # candidates examined (validated, then deleted or not) per second, 0 = unlimited
+  max_deletions_per_cycle: 0     # candidates handed to the workers per scan cycle, 0 = unlimited
+  max_pending_tasks: 100000      # bounded scheduler: memory stays bounded
+  batch_size: 64                 # candidates a worker takes at once
+  retry_limit: 5                 # transient failures (EBUSY, EIO, EACCES...) retried this many times
+  retry_initial_delay: "1s"      # then 2s, 4s... up to retry_max_delay
+  retry_max_delay: "1m"
+  skip_open_files: true          # never delete a file open through the mount
+  scheduler: "heap"              # "heap" (default) or "ordered"
+
+logging:
+  enabled: true
+  directory: "/var/log/tsfs"
+  filename: "tsfs.log"
+  level: "info"                  # trace, debug, info, warning, error, critical
+  format: "text"                 # "text" or "json" (JSON Lines)
+  console: false                 # also write to stderr (journald under systemd)
+  async:
+    enabled: true
+    queue_size: 8192             # messages
+    overflow_policy: "block"     # block, overrun_oldest or discard_new (losses are counted and reported)
+  rotation:
+    enabled: true
+    max_file_size: "50MiB"       # the active file is rotated before it would exceed this size
+    max_files: 10                # rotated files kept (tsfs.log.1 .. tsfs.log.10), active file excluded
+    check_interval: "1s"         # detection of an externally deleted/replaced active file
+    compress: false              # gzip rotated files in the background (tsfs.log.N.gz)
+    compression_level: 6         # 1 (fast) .. 9 (small)
+
+diagnostics:
+  enabled: false
+  text_stack_trace: true         # write tsfs-crash-<time>-<pid>.txt on a fatal signal
+  native_core_dump: false        # raise RLIMIT_CORE so that the kernel can write a core
+  crash_directory: "/var/lib/tsfs/crash"
+  max_crash_reports: 10          # older text reports are removed at startup (never core files)
+
+metrics:
+  enabled: true
+  status_file: "/run/tsfs/status.json"   # read by "tsfs --status"
+  interval: "10s"
+
+security:
+  stay_on_filesystem: true       # never cross a mount point inside the backing directory
+  require_openat2: false         # refuse to start without openat2(2) (Linux >= 5.6)

@@ -1,0 +1,23 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .gitignore
+# Purpose : Files that must never be committed (build trees, generated artifacts)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Every build tree (presets use build/<preset>), coverage, docs and benchmark output.
+/build/
+/out/
+# Crash artifacts of local runs.
+core
+core.[0-9]*
+tsfs-crash-*.txt
+# Editors and tools.
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+*~

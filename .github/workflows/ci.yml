@@ -1,0 +1,53 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .github/workflows/ci.yml
+# Purpose : Optional CI: the local quality gate (scripts/tsfs-qa.sh) in the dev image
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Every job builds the development image (docker/Dockerfile.dev) and runs one step
+# of scripts/tsfs-qa.sh through scripts/tsfs-dev.sh, exactly as on a workstation:
+# the CI adds no logic of its own. FUSE integration tests need /dev/fuse on the
+# runner; when it is missing they are reported as skipped, never as passed.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        step: [format, shell, deps, ci, debug, clang, tidy, tsan, coverage, doc]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Development image
+        run: scripts/tsfs-dev.sh --rebuild true
+      - name: qa ${{ matrix.step }}
+        run: scripts/tsfs-dev.sh --no-aslr scripts/tsfs-qa.sh ${{ matrix.step }}
+      - name: Coverage report
+        if: matrix.step == 'coverage'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: build/coverage/coverage/
+      - name: API documentation
+        if: matrix.step == 'doc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: doxygen-html
+          path: build/release/docs/html/

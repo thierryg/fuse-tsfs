@@ -1,0 +1,79 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (-O2, hardening, production logging defaults)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "Release with debug symbols (for separate symbol packages and profiling)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (-Og -g3, assertions, debug logging)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug + AddressSanitizer + UndefinedBehaviorSanitizer",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "TSFS_SANITIZE": "address;undefined", "TSFS_BUILD_BENCHMARKS": "OFF" }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + ThreadSanitizer (separate tree: incompatible with ASan)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "TSFS_SANITIZE": "thread", "TSFS_BUILD_BENCHMARKS": "OFF" }
+    },
+    {
+      "name": "coverage",
+      "displayName": "Debug + gcov instrumentation (build/coverage)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "TSFS_ENABLE_COVERAGE": "ON", "TSFS_BUILD_BENCHMARKS": "OFF" }
+    },
+    {
+      "name": "clang",
+      "displayName": "Debug with Clang 21 and warnings as errors",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CMAKE_CXX_COMPILER": "clang++", "TSFS_WARNINGS_AS_ERRORS": "ON" }
+    },
+    {
+      "name": "ci",
+      "displayName": "Release, warnings as errors (CI gate)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "TSFS_WARNINGS_AS_ERRORS": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "clang", "configurePreset": "clang" },
+    { "name": "ci", "configurePreset": "ci" }
+  ],
+  "testPresets": [
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true }, "execution": { "jobs": 4 } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true }, "execution": { "jobs": 4 } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true }, "execution": { "jobs": 4 } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true }, "execution": { "jobs": 2 } },
+    { "name": "coverage", "configurePreset": "coverage", "output": { "outputOnFailure": true }, "execution": { "jobs": 4 } },
+    { "name": "clang", "configurePreset": "clang", "output": { "outputOnFailure": true }, "execution": { "jobs": 4 } }
+  ]
+}

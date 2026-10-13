@@ -1,0 +1,47 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .clang-tidy
+# Purpose : Static analysis checks (clang-tidy >= 21), used by -DTSFS_ENABLE_CLANG_TIDY=ON
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Focus: defects (bugprone, clang-analyzer, concurrency, cert), not style. Each
+# disabled check is listed with its reason.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cert-err33-c,
+  cert-err34-c,
+  cert-flp30-c,
+  cert-oop58-cpp,
+  misc-redundant-expression,
+  misc-misplaced-const,
+  misc-throw-by-value-catch-by-reference,
+  misc-unconventional-assign-operator,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -concurrency-mt-unsafe,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -performance-enum-size,
+  -clang-analyzer-optin.performance.Padding
+# Disabled:
+#  bugprone-easily-swappable-parameters: flags every (path, path) or (int, int) API.
+#  bugprone-narrowing-conversions: duplicates -Wconversion-style noise on POSIX types.
+#  concurrency-mt-unsafe: reports strerror/getenv used before any thread starts or
+#    under a mutex; the remaining cases are reviewed manually.
+#  bugprone-implicit-widening-of-multiplication-result: only fires on compile-time
+#    constants (64 * 1024) that cannot overflow.
+#  performance-enum-size: enum underlying types are an ABI-free micro-optimization.
+#  clang-analyzer-optin.performance.Padding: reports long-lived singletons (Daemon)
+#    whose layout favors readability; never a per-file or per-request structure.
+WarningsAsErrors: ''
+HeaderFilterRegex: '^/(src|.*/tsfs)/(src|tests|benchmarks)/'
+FormatStyle: none
+CheckOptions:
+  # std::jthread passes its std::stop_token by value (a shared-state handle).
+  performance-unnecessary-value-param.AllowedTypes: 'std::stop_token'

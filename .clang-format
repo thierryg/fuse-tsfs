@@ -1,0 +1,39 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : .clang-format
+# Purpose : C++ formatting rules (clang-format >= 21)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+BasedOnStyle: Google
+Standard: Latest
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<(gtest|gmock|benchmark|fuse|spdlog|yaml-cpp|zlib)'
+    Priority: 1
+  - Regex: '^<[a-z_]+/.*\.h>|^<[a-z_]+\.h>'
+    Priority: 1
+  - Regex: '^<[a-z_]+>'
+    Priority: 2
+  - Regex: '.*'
+    Priority: 3
+SortIncludes: CaseSensitive
+# C++26 "= delete(reason)": without AfterPlacementOperator: false, clang-format 21
+# formats it like a placement delete ("delete (...)").
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+  AfterControlStatements: true
+  AfterForeachMacros: true
+  AfterIfMacros: true
+  AfterPlacementOperator: false

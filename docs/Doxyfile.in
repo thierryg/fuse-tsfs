@@ -1,0 +1,94 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : docs/Doxyfile.in
+# Purpose : Doxygen configuration template (configured by CMake/Documentation.cmake)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# Only non-default settings are listed. Paths are relative to the source root
+# (Doxygen runs with the source root as working directory).
+
+PROJECT_NAME           = "TSFS"
+PROJECT_NUMBER         = @PROJECT_VERSION@
+PROJECT_BRIEF          = "Time-aware Storage Filesystem for Linux"
+OUTPUT_DIRECTORY       = @TSFS_DOC_DIR@
+CREATE_SUBDIRS         = NO
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = @PROJECT_SOURCE_DIR@/src @PROJECT_SOURCE_DIR@
+STRIP_FROM_INC_PATH    = @PROJECT_SOURCE_DIR@/src
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+# GitHub-style heading ids, so that the "[...](#section)" links of the Markdown
+# documents resolve both on GitHub and in the generated HTML.
+MARKDOWN_ID_STYLE      = GITHUB
+TOC_INCLUDE_HEADINGS   = 3
+BUILTIN_STL_SUPPORT    = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_ANON_NSPACES   = NO
+HIDE_UNDOC_RELATIONS   = NO
+SORT_MEMBER_DOCS       = NO
+TIMESTAMP              = NO
+
+# --- input ------------------------------------------------------------------
+INPUT                  = README.md \
+                         CHANGELOG.md \
+                         CONTRIBUTING.md \
+                         SECURITY.md \
+                         docs/user \
+                         docs/architecture \
+                         docs/developer \
+                         docs/security \
+                         docs/testing \
+                         docs/performance \
+                         src
+FILE_PATTERNS          = *.hpp *.cpp *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = README.md
+EXAMPLE_PATH           = config
+IMAGE_PATH             = docs
+
+# --- preprocessing: the C++26 attributes and macros seen by the parser --------
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = FUSE_USE_VERSION=314 \
+                         "TSFS_DEFAULT_CONFIG_PATH=\"/etc/tsfs/config.yml\""
+
+# --- warnings: reported, never hidden ---------------------------------------
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = NO
+WARN_LOGFILE           = @TSFS_DOC_DIR@/doxygen-warnings.log
+
+# --- output -----------------------------------------------------------------
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+SEARCHENGINE           = YES
+GENERATE_LATEX         = NO
+SOURCE_BROWSER         = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+# --- diagrams (Graphviz) ----------------------------------------------------
+HAVE_DOT               = @TSFS_DOXYGEN_HAVE_DOT@
+DOT_PATH               = @TSFS_DOXYGEN_DOT_PATH@
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+CLASS_GRAPH            = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = NO
+DOT_GRAPH_MAX_NODES    = 60
+MAX_DOT_GRAPH_DEPTH    = 3
+DOT_MULTI_TARGETS      = YES

@@ -1,0 +1,62 @@
+# =============================================================================
+# TSFS - Time-aware Storage Filesystem for Linux
+# -----------------------------------------------------------------------------
+# File    : systemd/tsfs@.service.in
+# Purpose : systemd template unit: one TSFS filesystem per instance (configured by CMake)
+# Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+# Project : tsfs (version: VERSION)
+# Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+# =============================================================================
+# One instance per TSFS filesystem (mount point): tsfs@NAME.service runs
+#   @TSFS_INSTALL_FULL_BINDIR@/tsfs --config @TSFS_CONFIG_DIR@/NAME.yml --foreground
+# Each instance needs its own configuration file, with its own mount point, backing
+# directory, log directory, status file and crash directory (two daemons must never
+# share them). Example: @TSFS_CONFIG_DIR@/recordings.yml, then
+#   systemctl enable --now tsfs@recordings.service
+# The logs and state directories /var/log/tsfs/NAME and /var/lib/tsfs/NAME are
+# created by systemd (LogsDirectory=, StateDirectory=); use them in NAME.yml.
+# When the backing directory lives on a filesystem mounted at boot, order the
+# instance after it with a drop-in (systemctl edit tsfs@NAME.service):
+#   [Unit]
+#   RequiresMountsFor=/srv/recordings
+#
+# Why the sandboxing is limited: see tsfs.service (a private mount namespace would
+# hide the FUSE mount from the rest of the system).
+[Unit]
+Description=TSFS time-aware storage filesystem %i
+Documentation=man:tsfs(1) file://@TSFS_INSTALL_FULL_DOCDIR@/README.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+# Foreground: systemd supervises the process; SIGTERM unmounts cleanly.
+ExecStart=@TSFS_INSTALL_FULL_BINDIR@/tsfs --config @TSFS_CONFIG_DIR@/%i.yml --foreground
+# Re-reads the configuration without remounting (the daemon also watches the file).
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+# Per-instance locations for the logs, crash reports and status of this filesystem.
+StateDirectory=tsfs/%i
+StateDirectoryMode=0700
+LogsDirectory=tsfs/%i
+LogsDirectoryMode=0750
+UMask=0027
+# Root is needed to mount without fusermount3 and to keep the ownership of the
+# files created through the mount; the bounding set is reduced to what that uses.
+# (no CAP_MKNOD: device nodes are refused; no CAP_SETFCAP: no xattr support)
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+# No LimitCORE=: systemd's default (soft 0, hard infinity) lets the daemon raise the
+# soft limit itself when diagnostics.native_core_dump is enabled, and only then.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
