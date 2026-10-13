@@ -114,9 +114,14 @@ scripts/tsfs-dev.sh scripts/tsfs-qa.sh -j 8 debug            # -j: build/test pa
 | `doc` | Doxygen succeeds, no new warning |
 
 Each step runs in its own process; a failing step does not stop the following ones and
-the script ends with the list of failed steps (exit 1). The optional CI workflow
-(`.github/workflows/ci.yml`) runs one step per matrix job in the same development image,
-with no logic of its own ([building.md](building.md#42-local-quality-gate-scriptstsfs-qash)).
+the script ends with the list of failed steps (exit 1). Every step configures its tree
+with `--fresh`, so a stale local CMake cache cannot make the gate pass where a clean CI
+checkout fails. The optional CI workflow (`.github/workflows/ci.yml`) runs one step per
+matrix job in the same development image, with no logic of its own, and uploads the test
+logs of a failed job as the artifact `test-logs-<step>`
+([building.md](building.md#42-local-quality-gate-scriptstsfs-qash)). After a change of
+`docker/Dockerfile.dev` (for example the addition of `libclang-rt-dev` for the `clang`
+step), rebuild the local image: `scripts/tsfs-dev.sh --rebuild true`.
 
 The steps are equivalent to these manual commands, from the fastest to the slowest:
 

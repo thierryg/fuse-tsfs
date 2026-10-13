@@ -52,7 +52,24 @@ from the configuration and `-d` for `--fuse-debug`, then calls `fuse_new` and
 `fuse_mount`. `FuseSession::loop` runs `fuse_loop_mt` with
 `fuse_loop_cfg_set_idle_threads(10)` and `clone_fd = 0`. The destructor removes
 libfuse's signal handlers, unmounts, then destroys the `fuse` object, so every
-exit path leaves no stale mount.
+exit path leaves no stale mount. The `fsname`/`subtype` options make the mount
+appear with filesystem type `fuse.tsfs` in `/proc/self/mountinfo`, which is how
+the `tsfs-ls` wrapper (the system `ls` by default) recognizes TSFS mounts.
+
+The operation table passed to `fuse_new` is `PassthroughFs::operations(
+retention_xattrs)`: with `filesystem.retention_xattrs: false` it is a copy without
+the `getxattr` and `listxattr` callbacks (see section 3.1).
+
+Right after `fuse_mount`, the daemon reads the kernel connection identifier of the
+mount (`fuse_connection_id`, `src/filesystem/fuse_control.cpp`): the device number
+of the FUSE mount on the mount point, taken from `/proc/self/mountinfo` (the last,
+topmost one), in the kernel encoding `major << 20 | minor` (FUSE mounts use an
+anonymous device of major 0). It never calls `stat()` on its own mount: that would
+be a FUSE request to a daemon whose loop is not running yet. The identifier names
+`/sys/fs/fuse/connections/<id>/` (fusectl); `fuse_connection_waiting` reads its
+`waiting` file at each status write (`null` when fusectl is not mounted or the file
+is unreadable). It is published in the `fuse` section of the status file and in the
+`fuse_control` field of `filesystem_mounted`.
 
 `PassthroughFs::init` sets the libfuse configuration:
 
@@ -184,17 +201,60 @@ mount is also `ro`, so the kernel normally refuses first). "Lock" lists the
 | `utimens` | `futimens(fh)` (marks modified) or, after the device check, `utimensat(..., AT_SYMLINK_NOFOLLOW)`. | yes | path (path form) | path form: yes; handle form: on release |
 | `fallocate` | `fallocate(fd, mode, offset, length)` on an open handle only (`EOPNOTSUPP` without one); marks modified. | yes | | on release |
 | `lseek` | `lseek` on the backing descriptor (`SEEK_DATA`/`SEEK_HOLE` pass through); `EBADF` without a handle. | | | |
+| `getxattr` | Read-only retention attributes (section 3.1); `ENODATA` for any other name, without disk access. | | | |
+| `listxattr` | Always an empty list (section 3.1). | | | |
 
-The 28 operations above are the counters reported in the status file
+The 30 operations above are the counters reported in the status file
 (`FsOp`, `src/filesystem/passthrough_fs.hpp`), plus `bytes_read`,
 `bytes_written` and `open_handles`.
+
+### 3.1 Retention extended attributes
+
+`getxattr` serves four virtual, read-only attributes, computed at each request
+from the policy of the current configuration snapshot:
+
+| Name | Value |
+|---|---|
+| `user.tsfs.state` | `expires`, `expired` (expiry reached, deletion pending), `excluded` or `never` |
+| `user.tsfs.expires` | expiry, ISO 8601 UTC to the second (`%FT%TZ`); only for `expires` and `expired` |
+| `user.tsfs.rule` | identifier of the deciding rule, or `default` |
+| `user.tsfs.created` | birth time of the backing file (statx `btime`), ISO 8601 UTC to the second, or `st_mtime` when the backing filesystem does not report it |
+
+* A name outside `user.tsfs.` (for example the `security.capability` lookup the
+  kernel makes before each write, or ACL probes), or an unknown `user.tsfs.*`
+  name, returns `ENODATA` immediately: no path resolution, no disk access.
+* For the four names, the path is resolved with `open_parent` and the entry read
+  with `stat_entry` (no symlink following; birth time always requested, for
+  `user.tsfs.created`).
+  Only regular files of the managed tree have attributes: the root, directories,
+  symbolic links, special files, files on another device (with
+  `stay_on_filesystem`) and the absence of a policy give `ENODATA`; resolution
+  errors (`ENOENT`, `EXDEV`...) are returned as is. The decision is the one the
+  GC would make (`PolicyEngine::evaluate`), with the expiry compared to the wall
+  clock.
+* Values follow the FUSE convention: size 0 returns the length, a short buffer
+  `ERANGE`; no terminating NUL.
+* `listxattr` returns 0 (an empty list) on purpose: GNU `ls` (coreutils 9 and
+  later) prints a `+` after the mode of any file whose `listxattr` is not empty,
+  which would mark every file of the mount as if it had an ACL. The attributes
+  are read by name (`getfattr -n`, `tsfs-ls` with `lgetxattr`).
+* `setxattr` and `removexattr` stay unset, and the real attributes of the
+  backing files are never exposed.
+
+Cost: once a `getxattr` callback exists, the kernel sends one `getxattr`
+(`security.capability`, the file-capability check made before a write) request
+before each write request, counted as a `getxattr` error. With
+`filesystem.retention_xattrs: false` both callbacks are removed: libfuse answers
+`ENOSYS` once and the kernel stops asking. Measurements:
+[benchmark report](../performance/benchmark-report.md#8-retention-extended-attributes-cost).
 
 ## 4. Unsupported operations
 
 Callbacks not set in the operation table, so libfuse answers `ENOSYS` to the
 kernel (`PassthroughFs::operations()`):
 
-* extended attributes: `setxattr`, `getxattr`, `listxattr`, `removexattr`;
+* extended attributes: `setxattr`, `removexattr` (and `getxattr`, `listxattr`
+  when `filesystem.retention_xattrs` is `false`);
 * `ioctl`, `poll`, `bmap`;
 * `lock` and `flock`: POSIX and BSD locks are handled locally by the kernel
   (they are not propagated to the backing filesystem, so they do not

@@ -86,6 +86,36 @@ benchmarks.
   already mounted (second instance) refused.
 - Handles left open at shutdown freed (regression test verified to fail without the fix).
 - Several filesystems side by side (two instances verified manually).
+- Kernel FUSE connection in the status file (`fuse.connection_id`, `control_dir`,
+  `waiting`), read from `/proc/self/mountinfo` after mounting (`FuseControl.*`,
+  `MountTest.StatusFileNamesTheFuseConnection`).
+- Read-only retention extended attributes `user.tsfs.state`, `user.tsfs.expires`,
+  `user.tsfs.rule`, `user.tsfs.created` (empty `listxattr`), `filesystem.retention_xattrs`
+  (`MountTest.RetentionExtendedAttributes`); cost measured by an A/B benchmark
+  (about -28 % on small-file writes, see the benchmark report).
+- `tsfs --purge` and `SIGUSR2`: unthrottled purge of every expired file by the
+  daemon, offline purge without a mount, refusals (mounted without a daemon,
+  `dry_run`), confirmation and `--force`, preview (`GcTest.Purge*`,
+  `MountTest.PurgeCommandDeletesExpiredFilesThroughTheDaemon`,
+  `CommandLine.PurgeStatsAndPreview`, `ReloadTest.SighupBridgeAlwaysReloads` for the
+  `SIGUSR2` bridge).
+- `tsfs --stats` (per-rule table; exercised by the purge mount test).
+- `tsfs-ls`, a wrapper around the original `ls` (`ls.orig`): outside TSFS mounts, in
+  pipes and with `TSFS_LS=off` it runs `ls.orig` with the unchanged command line;
+  inside a TSFS mount on a terminal it runs `ls.orig` with `-l --dired` appended after the user's options (before a `--`) and
+  uses the dired byte offsets to append a retention tag to each entry
+  (`created ..., filter ..., deleted ... (in ...)`, `deletion pending`,
+  `UNFILTERED`), so every option of the system `ls` keeps its meaning
+  (`MountTest.TsfsLsShowsRetentionOnATerminalAndDelegatesOtherwise`: tag format,
+  `-R -I` through `ls.orig`, byte-identical output in a pipe). At installation the
+  system `ls` is renamed `/usr/bin/ls.orig` (a symbolic link, such as the uutils
+  coreutils one of Ubuntu 26.04, is renamed as is) and the wrapper installed as
+  `/usr/bin/ls`; uninstallation renames it back. Verified as root in a throwaway
+  container with uutils coreutils 0.8.0 (install, reinstall, uninstall restoring the
+  identical link).
+- Signals blocked from the start of the daemon: a `SIGTERM` during startup unmounts
+  cleanly (`MountTest.SigtermDuringStartupUnmountsCleanly`, verified to fail without
+  the fix; found by TSan runs on 2 CPUs).
 - CMake targets `deps`, `build`, `tests`, `coverage`, `doc`, `bench`, `install`,
   `uninstall`; staged install/reinstall/uninstall and a real root install and
   uninstall in a throwaway container (configuration preserved, 13 files removed).
@@ -99,8 +129,12 @@ benchmarks.
   is opt-in (`TSFS_TEST_ENABLE_CORE_DUMPS=1`) and was skipped in the final run.
 - **Fallback path resolution on kernels < 5.6**: tested by forcing the fallback on a
   6.8 kernel, not on an old kernel.
-- **CI workflow** (`.github/workflows/ci.yml`): YAML validated, never executed on
-  GitHub; it only calls `scripts/tsfs-qa.sh`, which was executed.
+- **CI workflow** (`.github/workflows/ci.yml`): it only calls `scripts/tsfs-qa.sh`,
+  which was executed locally. Its first GitHub runs failed in the `clang` (missing
+  Clang sanitizer runtimes) and `tidy` (`@*.modmap` arguments) jobs; both causes are
+  fixed (`libclang-rt-dev` in the image, module scanning disabled, `--fresh`
+  configuration, `checkout@v5`/`upload-artifact@v5`, test logs uploaded on failure),
+  but the workflow has not been re-run on GitHub since.
 - **Dedicated backing filesystem steps** of the user guide (LVM, `mkfs.ext4`,
   fstab line for the backing storage): standard administration commands, not run
   (no block device in the container).
@@ -111,6 +145,9 @@ benchmarks.
   report says `INCOMPLETE` instead of listing every file.
 - **FUSE performance**: functional baseline only (see section 7); no kernel FUSE
   passthrough, no writeback cache.
+- **`tsfs-ls`**: colors are not shown in TSFS listings (`ls.orig` writes to a pipe),
+  and non-long formats become one entry per line followed by its tag (a column
+  layout cannot carry it).
 - **Symbolization of stripped libraries**: internal libc/libfuse frames show
   `?? (module+offset)`.
 
@@ -118,9 +155,10 @@ benchmarks.
 
 - Persistent metadata index (not needed: see section 3).
 - Administrative IPC beyond the status file and signals (no concrete requirement;
-  no deletion command is exposed).
+  the only deletion command, the purge, is a signal: `SIGUSR2`).
 - `/etc/fstab` / `mount -t fuse.tsfs` helper interface (systemd units instead).
-- Extended attributes, ioctl, poll; propagation of file locks to the backing
+- Extended attributes other than the four read-only retention attributes (no
+  `setxattr`/`removexattr`, backing attributes not exposed), ioctl, poll; propagation of file locks to the backing
   filesystem; `copy_file_range` offload (the kernel falls back to read/write) (listed in [filesystem.md](../architecture/filesystem.md#4-unsupported-operations)).
 - Cold-cache benchmarks and the 1,000,000-file GC datasets (opt-in, not run).
 
@@ -134,13 +172,18 @@ benchmarks.
 
 ## 5. Build results
 
+Final gate run of 2026-10-13 (12:08-12:15 UTC) on a clean copy of the repository,
+exactly as the CI does (`scripts/tsfs-qa.sh`, every step), plus ThreadSanitizer on a
+container limited to 2 CPUs, repeated 3 times (the condition that exposed the
+startup signal race seen in CI).
+
 | Tree | Compiler / flags | Result |
 |---|---|---|
-| `ci` | GCC 15.2, Release, `-Werror` | builds without warnings, 196/196 tests |
-| `debug` | GCC 15.2, Debug, ASan + LSan + UBSan | 196 tests: 194 passed, 2 skipped, 0 failed |
-| `clang` | Clang 21, Debug (sanitized), `-Werror` | builds without warnings, 194 passed, 2 skipped |
-| `tsan` | GCC 15.2, Debug, ThreadSanitizer | 194 passed, 2 skipped, no TSan report |
-| `coverage` | GCC 15.2, Debug, `--coverage` | 194 passed, 2 skipped |
+| `ci` | GCC 15.2, Release, `-Werror` | builds without warnings, 206 tests, 0 failed |
+| `debug` | GCC 15.2, Debug, ASan + LSan + UBSan | 206 tests: 204 passed, 2 skipped, 0 failed |
+| `clang` | Clang 21, Debug (sanitized), `-Werror` | builds without warnings, 204 passed, 2 skipped |
+| `tsan` | GCC 15.2, Debug, ThreadSanitizer | 204 passed, 2 skipped, no TSan report (also 3 x on 2 CPUs) |
+| `coverage` | GCC 15.2, Debug, `--coverage` | 204 passed, 2 skipped |
 | `release` | GCC 15.2, Release | builds, all tests and benchmarks run |
 
 The two skipped tests: the opt-in native core dump test and the root-only bind
@@ -151,8 +194,8 @@ analyzer false positive suppressed at its line with a reason), shellcheck clean 
 
 ## 6. Test results and coverage
 
-196 test cases in 11 executables (labels: unit 91, policy 27, config 33, reload 10,
-gc 50, concurrency 101, logging 20, diagnostics 10, security 63, filesystem 21,
+206 test cases in 11 executables (labels: unit 94, policy 27, config 34, reload 10,
+gc 52, concurrency 108, logging 20, diagnostics 10, security 70, filesystem 26,
 stress 2). Strategy and per-suite content:
 [test-strategy.md](../testing/test-strategy.md).
 
@@ -160,9 +203,9 @@ Coverage (gcov/lcov, `coverage` preset, production sources only):
 
 | Metric | Covered |
 |---|---|
-| Lines | **81.0 %** (3,843 / 4,740) |
-| Functions | **92.8 %** (493 / 531) |
-| Branches | **52.9 %** (3,696 / 6,980) |
+| Lines | **80.0 %** (4,355 / 5,441) |
+| Functions | **92.5 %** (538 / 581) |
+| Branches | **51.2 %** (4,243 / 8,276) |
 
 Least covered: `src/diagnostics/crash_handler.cpp` (the handler runs in processes
 that crash, which never write their gcov counters), `src/app/application.cpp` (the
@@ -178,7 +221,9 @@ and environment lost by `gtest_discover_tests`, ownership handover by name (race
 mount, daemon umask applied twice, status file temporary name and concurrent
 writers, `ConfigWatcher::watch_` data race, unvalidated `-m`/`-b`, `-d` accepted with
 actions, `deps` false negatives, handles leaked at shutdown (LSan), stacked mount on
-an already mounted mount point.
+an already mounted mount point, `SIGTERM` during startup leaving a dead mount
+(TSan runs on 2 CPUs), CI image without the Clang sanitizer runtimes, clang-tidy
+failing on `@*.modmap` arguments of a configured-only tree.
 
 ## 7. Benchmark results (synthetic, warm cache)
 
@@ -198,7 +243,7 @@ Full report: [benchmark-report.md](../performance/benchmark-report.md). Highligh
 - User: [user-guide.md](../user/user-guide.md) (24 chapters, including the
   step-by-step creation of a filesystem and its mount point),
   [configuration.md](../user/configuration.md), [monitoring.md](../user/monitoring.md),
-  man page `docs/man/tsfs.1`.
+  man pages `docs/man/tsfs.1` and `docs/man/tsfs-ls.1`.
 - Developer: [building](building.md), [coding style](coding-style.md),
   [testing](testing.md), [debugging](debugging.md), [coverage](coverage.md),
   [performance](performance.md), [contributing](contributing.md),
@@ -240,6 +285,12 @@ exit, not a TSFS leak).
    and kernel FUSE passthrough, each against the baseline.
 3. Run the 1,000,000-file GC datasets and cold-cache measurements on dedicated
    hardware.
-4. Execute the CI workflow on GitHub.
-5. Raise branch coverage (52.9 %), mainly error paths of `passthrough_fs.cpp` and
+4. Re-run the CI workflow on GitHub after the image and workflow fixes (never re-run
+   since).
+5. Raise branch coverage (51.2 %), mainly error paths of `passthrough_fs.cpp` and
    `application.cpp`; run the root-only tests automatically in a privileged CI job.
+6. `tsfs-ls`: colors are not shown in TSFS listings; add them if users ask for it.
+   The replacement of
+   `/usr/bin/ls` is not packaged (a `dpkg-divert` in a Debian package would be the
+   clean way).
+7. Run the full quality gate again with the 206 tests and update sections 5 and 6.

@@ -1,0 +1,323 @@
+.\" =============================================================================
+.\" TSFS - Time-aware Storage Filesystem for Linux
+.\" =============================================================================
+.\" File    : docs/man/tsfs-ls.1
+.\" Purpose : Manual page of tsfs-ls, the ls wrapper that tags the retention of TSFS files (section 1)
+.\" Author  : Thierry Gayet <thierry.gayet@labworks.fr>
+.\" Project : tsfs (version: VERSION)
+.\" Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
+.\" =============================================================================
+.TH TSFS-LS 1 2026-10-13 "tsfs" "User Commands"
+.SH NAME
+tsfs\-ls \- list directory contents, tagging the retention of each entry inside TSFS mounts
+.SH SYNOPSIS
+.SY ls
+.RI [ option ...]
+.RI [ file ...]
+.YS
+.SY tsfs\-ls
+.RI [ option ...]
+.RI [ file ...]
+.YS
+.SH DESCRIPTION
+.B tsfs\-ls
+is a wrapper around the system
+.BR ls (1)
+for systems that use
+.BR tsfs (1).
+It is installed as
+.I /usr/bin/ls
+by default, the system
+.B ls
+being renamed
+.IR /usr/bin/ls.orig .
+It never lists anything itself: every listing is produced by the original
+.BR ls ,
+so it accepts all the options of the system
+.B ls
+with their usual meaning.
+.PP
+The original
+.B ls
+is executed with the unchanged command line
+.RB ( execv (3))
+when:
+.IP \(bu 2
+no
+.I file
+operand is inside a TSFS mount (filesystem type
+.B fuse.tsfs
+in
+.IR /proc/self/mountinfo );
+without operand, the current directory is the target;
+.IP \(bu 2
+standard output is not a terminal (pipes, redirections, scripts get exactly the
+output of the system
+.BR ls );
+.IP \(bu 2
+the environment variable
+.B TSFS_LS
+is set to
+.BR off ;
+.IP \(bu 2
+the options include
+.BR \-\-help ", " \-\-version ", " \-\-zero ", " \-\-dired " or " \-D .
+.PP
+Otherwise (at least one operand inside a TSFS mount, and a terminal or
+.BR TSFS_LS=always ),
+the original
+.B ls
+runs with the user's options followed by
+.B "\-l \-\-dired"
+(inserted before a
+.BR \-\- ,
+so that a later
+.BR \-C ", " \-x " or " \-m
+cannot cancel the long format), then the operands, its standard output captured.
+The dired trailer
+.RB ( //DIRED//
+gives the byte offsets of every listed name,
+.B //SUBDIRED//
+those of the directory headers; GNU coreutils and uutils coreutils produce it)
+tells exactly which entry is on which line, so sorting,
+.BR \-a ", " \-A ", " \-R ", " \-I ", " \-\-hide ", " \-\-ignore ,
+.BR \-\-time\-style ", " \-i ", " \-s ", " \-n ", " \-h ,
+several operands and glob patterns keep their meaning.
+Each entry then receives a tag:
+.IP \(bu 2
+with a long format
+.RB ( \-l ", " \-n ", " \-g ", " \-o ", " \-\-format=long " or " verbose ),
+the lines of the original
+.B ls
+are kept (without the two-space dired indentation) and the tag is appended to each
+entry line;
+.IP \(bu 2
+with any other format, each entry is printed on its own line followed by its tag
+(a column layout cannot carry it); the
+.B total
+lines are dropped, the directory headers and blank lines are kept.
+.PP
+Options that take their value as the next argument
+.RB ( \-I ", " \-T ", " \-w ", " \-\-block\-size ", " \-\-format ", " \-\-hide ,
+.BR \-\-ignore ", " \-\-indicator\-style ", " \-\-quoting\-style ", " \-\-sort ,
+.BR \-\-tabsize ", " \-\-time ", " \-\-time\-style ", " \-\-width )
+are recognized, so their value is not taken for an operand.
+If the output of the original
+.B ls
+has no dired trailer (an
+.B ls
+without
+.B \-\-dired
+support), it is printed unchanged, without tags.
+With
+.BR filesystem.retention_xattrs: " false"
+in the daemon configuration, every entry is tagged
+.BR "RETENTION UNKNOWN (filesystem.retention_xattrs is false)" .
+.SS Tags
+The tag is computed from the read-only extended attributes served by the TSFS
+daemon
+.RB ( user.tsfs.state ", " user.tsfs.rule ", " user.tsfs.expires ", " user.tsfs.created );
+dates are in local time
+.RI ( YYYY\-MM\-DD " " HH:MM ).
+.TP
+.RI "created " date ", filter " rule ", deleted " date " (in " remaining )
+TSFS will delete the file at that date; the remaining time is shown in days and
+hours, hours and minutes, minutes, or seconds.
+.TP
+.RI "created " date ", filter " rule ", deletion pending (expired " date )
+The file is already expired; the garbage collector will delete it soon.
+.TP
+.B UNFILTERED
+TSFS will never delete the entry: no expiring rule matches (retention
+.B never
+or default
+.BR never ),
+an exclude rule matches, or it is a directory, a symbolic link or a special file.
+.PP
+.B created
+is the birth time of the backing file
+.RB ( statx (2)
+.BR btime )
+when the backing filesystem reports it, else its modification time.
+The deletion date is computed from the timestamp of the rule (the modification
+time by default, the birth time with
+.BR "timestamp: birth" ),
+so
+.B created
+can differ from the date the expiry is based on: a file whose modification time
+was set in the past shows
+.B created
+today but can already be expired.
+.PP
+Output example on a terminal (uutils coreutils 0.8.0 as the original
+.BR ls ):
+.PP
+.in +4n
+.EX
+$ ls \-l rec
+total 20
+\-rw\-r\-\-r\-\- 1 dev dev    6 Oct 13 12:30 clip.mp4  created 2026\-10\-13 12:30, filter rec, deleted 2026\-10\-14 12:30 (in 1d 0h)
+\-rw\-r\-\-r\-\- 1 dev dev    2 Oct 13 12:30 hold.keep  UNFILTERED
+\-rw\-r\-\-r\-\- 1 dev dev    2 Oct 11 12:30 old.mp4  created 2026\-10\-13 12:30, filter rec, deletion pending (expired 2026\-10\-12 12:30)
+\-rw\-r\-\-r\-\- 1 dev dev    2 Oct 13 12:30 sp ace.mp4  created 2026\-10\-13 12:30, filter rec, deleted 2026\-10\-14 12:30 (in 1d 0h)
+drwxr\-xr\-x 2 dev dev 4096 Oct 13 12:30 sub  UNFILTERED
+$ ls \-R rec
+rec:
+clip.mp4  created 2026\-10\-13 12:30, filter rec, deleted 2026\-10\-14 12:30 (in 1d 0h)
+hold.keep  UNFILTERED
+old.mp4  created 2026\-10\-13 12:30, filter rec, deletion pending (expired 2026\-10\-12 12:30)
+sp ace.mp4  created 2026\-10\-13 12:30, filter rec, deleted 2026\-10\-14 12:30 (in 1d 0h)
+sub  UNFILTERED
+
+rec/sub:
+deep.mp4  created 2026\-10\-13 12:30, filter rec, deleted 2026\-10\-14 12:30 (in 1d 0h)
+.EE
+.in
+.PP
+Colors are not shown in TSFS listings (the original
+.B ls
+writes to a pipe), and control characters in names are printed as
+.BR ? .
+.SS The original ls
+The original
+.B ls
+is, in this order:
+.BR $TSFS_REAL_LS ,
+.I /usr/bin/ls.orig
+(the build option
+.B TSFS_SYSTEM_LS
+followed by
+.BR .orig ),
+then the first
+.B ls
+of the
+.B PATH
+that is not the wrapper itself (recognized by its marker string
+.BR TSFS\-LS\-WRAPPER\-v2 ).
+It always runs with
+.I argv[0]
+set to
+.BR ls :
+multi-call binaries such as uutils coreutils select the utility from it.
+.SH OPTIONS
+All the options of the system
+.BR ls (1).
+.B tsfs\-ls
+has no option of its own.
+.SH ENVIRONMENT
+.TP
+.B TSFS_LS
+.B off
+makes every call run the original
+.B ls
+with the unchanged command line;
+.B always
+tags TSFS listings even when standard output is not a terminal.
+.TP
+.B TSFS_REAL_LS
+Path of the original
+.B ls
+to run, tried first (it must be executable).
+.SH FILES
+.TP
+.I /usr/bin/ls
+The wrapper, at a default root installation (the path follows the build option
+.BR TSFS_SYSTEM_LS ).
+.TP
+.I /usr/bin/ls.orig
+The system
+.BR ls ,
+renamed when the wrapper was installed: a regular file (GNU coreutils) or a
+symbolic link (for example to the uutils coreutils multi-call binary), kept as is.
+It can be run directly.
+.TP
+.I /usr/local/bin/tsfs\-ls
+The wrapper under its own name (always installed).
+.TP
+.I /proc/self/mountinfo
+Read to find the TSFS mounts.
+.SH EXIT STATUS
+The exit status of the original
+.BR ls .
+2 when the original
+.B ls
+cannot be found or run
+.RB ( "ls: the original ls cannot be found (/usr/bin/ls.orig missing; set TSFS_REAL_LS)" ).
+.SH NOTES
+By default,
+.B "cmake \-\-install"
+run as root, without
+.BR DESTDIR ,
+renames the system
+.I /usr/bin/ls
+to
+.I /usr/bin/ls.orig
+.RB ( rename (2),
+no copy; a symbolic link is renamed as is), then installs the wrapper as
+.I /usr/bin/ls
+(copied to a temporary name, then renamed: the replacement is atomic).
+A staged or package installation
+.RB ( DESTDIR )
+or an installation by another user never touches it.
+Installing again only refreshes the wrapper; if a coreutils reinstallation or
+upgrade put the system
+.B ls
+back over the wrapper, it is renamed over the stale
+.IR ls.orig .
+If
+.I /usr/bin/ls
+is the wrapper but
+.I /usr/bin/ls.orig
+is missing, the installation fails and asks for
+.BR "apt install \-\-reinstall coreutils" .
+Build with
+.B \-DTSFS_REPLACE_SYSTEM_LS=OFF
+to keep the system
+.B ls
+.RB ( tsfs\-ls
+stays installed under its own name).
+.PP
+The
+.B uninstall
+target of the build tree renames
+.I /usr/bin/ls.orig
+back to
+.I /usr/bin/ls
+(identical original; a symbolic link keeps its target).
+If
+.I ls.orig
+is missing, it prints a warning with the
+.B coreutils
+reinstall command; if
+.I /usr/bin/ls
+is already the system one, it removes the stale
+.IR ls.orig .
+.PP
+.I /usr/bin/ls
+belongs to the
+.B coreutils
+package:
+.B "dpkg \-\-verify coreutils"
+reports it while the wrapper is in place, and a coreutils upgrade puts the system
+.B ls
+back over the wrapper; install TSFS again to re-apply it.
+.PP
+The retention attributes exist only when the daemon runs with
+.B filesystem.retention_xattrs
+true (the default); without them every entry is tagged
+.BR UNFILTERED .
+They are not returned by
+.BR listxattr (2);
+read them by name with
+.BR "getfattr \-n user.tsfs.state" " \fIfile\fR."
+.SH SEE ALSO
+.BR ls (1),
+.BR tsfs (1),
+.BR getfattr (1),
+.BR getxattr (2).
+.PP
+The user guide
+.RI ( user\-guide.md ,
+"Retention of a file" and "The TSFS ls replacing the system ls"), installed in the
+TSFS documentation directory (by default
+.IR /usr/local/share/doc/tsfs/user/ ).

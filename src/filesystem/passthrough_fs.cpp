@@ -16,13 +16,18 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
 #include <mutex>
 #include <new>
+#include <optional>
+#include <string>
 #include <type_traits>
+
+#include "fsutil/entry_stat.hpp"
 
 namespace tsfs {
 
@@ -104,9 +109,10 @@ constexpr auto tramp = &Trampoline<Method, Op>::call;
 
 const char* to_string(FsOp op) noexcept {
     static constexpr std::array<const char*, kFsOpCount> kNames{
-        "getattr", "readlink",   "mknod",    "mkdir",  "unlink", "rmdir",   "symlink",   "rename",  "link",  "chmod",
-        "chown",   "truncate",   "open",     "read",   "write",  "statfs",  "flush",     "release", "fsync", "opendir",
-        "readdir", "releasedir", "fsyncdir", "access", "create", "utimens", "fallocate", "lseek"};
+        "getattr", "readlink", "mknod",     "mkdir",    "unlink",   "rmdir",      "symlink",  "rename",
+        "link",    "chmod",    "chown",     "truncate", "open",     "read",       "write",    "statfs",
+        "flush",   "release",  "fsync",     "opendir",  "readdir",  "releasedir", "fsyncdir", "access",
+        "create",  "utimens",  "fallocate", "lseek",    "getxattr", "listxattr"};
     const auto index = static_cast<std::size_t>(op);
     return index < kNames.size() ? kNames[index] : "unknown";
 }
@@ -157,8 +163,8 @@ std::unique_ptr<PassthroughFs::DirHandle> PassthroughFs::take_dir(fuse_file_info
     return handle;
 }
 
-const fuse_operations& PassthroughFs::operations() noexcept {
-    static const fuse_operations ops = [] {
+const fuse_operations& PassthroughFs::operations(bool with_xattrs) noexcept {
+    static const fuse_operations with = [] {
         fuse_operations o{};
         o.init = [](fuse_conn_info* conn, fuse_config* cfg) -> void* {
             auto* self = static_cast<PassthroughFs*>(fuse_get_context()->private_data);
@@ -192,9 +198,19 @@ const fuse_operations& PassthroughFs::operations() noexcept {
         o.utimens = tramp<&PassthroughFs::utimens, FsOp::utimens>;
         o.fallocate = tramp<&PassthroughFs::fallocate, FsOp::fallocate>;
         o.lseek = tramp<&PassthroughFs::lseek, FsOp::lseek>;
+        o.getxattr = tramp<&PassthroughFs::getxattr, FsOp::getxattr>;
+        o.listxattr = tramp<&PassthroughFs::listxattr, FsOp::listxattr>;
         return o;
     }();
-    return ops;
+    // Without the xattr callbacks the kernel stops asking (ENOSYS once): no round trip
+    // for security.capability on each write.
+    static const fuse_operations without = [] {
+        fuse_operations o = with;
+        o.getxattr = nullptr;
+        o.listxattr = nullptr;
+        return o;
+    }();
+    return with_xattrs ? with : without;
 }
 
 void* PassthroughFs::init(fuse_conn_info* /*conn*/, fuse_config* cfg) {
@@ -821,6 +837,113 @@ off_t PassthroughFs::lseek(const char* /*path*/, off_t offset, int whence, fuse_
     }
     const off_t result = ::lseek(file_of(fi)->fd.get(), offset, whence);
     return result < 0 ? -errno : result;
+}
+
+namespace {
+
+constexpr std::string_view kXattrPrefix = "user.tsfs.";
+
+/// Copy @p text as an xattr value or list (no terminating NUL is added): FUSE
+/// semantics, size 0 asks for the length.
+int xattr_reply(std::string_view text, char* out, size_t size) {
+    if (size == 0) {
+        return static_cast<int>(text.size());
+    }
+    if (size < text.size()) {
+        return -ERANGE;
+    }
+    std::memcpy(out, text.data(), text.size());
+    return static_cast<int>(text.size());
+}
+
+/// Retention attributes of a regular file of the managed tree.
+struct RetentionAttributes {
+    std::string state;
+    std::string rule;
+    std::string expires;  ///< Empty unless the file expires.
+    std::string created;  ///< Birth time when the filesystem reports it, else st_mtime.
+};
+
+/// @return the attributes of @p path, or nullopt with @p error set (ENODATA when the
+///         entry has none: not a regular file, the root, no policy, other device).
+std::optional<RetentionAttributes> retention_attributes(const PassthroughFs::Dependencies& deps, std::string_view path,
+                                                        int& error) {
+    const std::shared_ptr<const PolicyEngine> policy = deps.policy ? deps.policy() : nullptr;
+    if (!policy) {
+        error = ENODATA;
+        return std::nullopt;
+    }
+    auto parent = deps.store.open_parent(path);
+    if (!parent) {
+        error = parent.error().code;
+        return std::nullopt;
+    }
+    if (parent->name == ".") {
+        error = ENODATA;
+        return std::nullopt;
+    }
+    auto st = stat_entry(parent->directory.get(), parent->name.c_str(), /*want_birth=*/true);
+    if (!st) {
+        error = st.error().code;
+        return std::nullopt;
+    }
+    if (!st->is_regular() ||
+        (deps.store.options().stay_on_filesystem && st->identity.device != deps.store.root_device())) {
+        error = ENODATA;  // The GC only ever deletes regular files of the managed tree.
+        return std::nullopt;
+    }
+    const Decision decision = policy->evaluate(path, st->times);
+    RetentionAttributes attributes;
+    attributes.rule = std::string(policy->rule_id(decision.rule_index));
+    attributes.created = std::format(
+        "{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(st->times.birth.value_or(st->times.modification)));
+    switch (decision.kind) {
+        case Decision::Kind::keep_forever: attributes.state = "never"; break;
+        case Decision::Kind::excluded: attributes.state = "excluded"; break;
+        case Decision::Kind::expires: {
+            const TimePoint now = std::chrono::time_point_cast<std::chrono::milliseconds>(WallClock::now());
+            attributes.state = decision.expired_at(now) ? "expired" : "expires";
+            attributes.expires = std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(decision.expiry));
+            break;
+        }
+    }
+    return attributes;
+}
+
+}  // namespace
+
+int PassthroughFs::getxattr(const char* path, const char* name, char* value, size_t size) {
+    const std::string_view key = name;
+    if (!key.starts_with(kXattrPrefix)) {
+        return -ENODATA;  // security.capability on every write, ACL probes...: no disk access.
+    }
+    const std::string_view attribute = key.substr(kXattrPrefix.size());
+    if (attribute != "state" && attribute != "rule" && attribute != "expires" && attribute != "created") {
+        return -ENODATA;
+    }
+    int error = 0;
+    const auto attributes = retention_attributes(deps_, path, error);
+    if (!attributes) {
+        return -error;
+    }
+    if (attribute == "state") {
+        return xattr_reply(attributes->state, value, size);
+    }
+    if (attribute == "rule") {
+        return xattr_reply(attributes->rule, value, size);
+    }
+    if (attribute == "created") {
+        return xattr_reply(attributes->created, value, size);
+    }
+    return attributes->expires.empty() ? -ENODATA : xattr_reply(attributes->expires, value, size);
+}
+
+int PassthroughFs::listxattr(const char* /*path*/, char* /*list*/, size_t /*size*/) {
+    // The user.tsfs.* attributes are NOT listed: GNU ls (coreutils >= 9) shows a "+"
+    // (as for an ACL) after the mode of any file whose listxattr is not empty, which
+    // would mislead every "ls -l" of the mount. They are read by name (getxattr,
+    // tsfs-ls, "getfattr -n user.tsfs.state"); real backing xattrs are not exposed.
+    return 0;
 }
 
 }  // namespace tsfs

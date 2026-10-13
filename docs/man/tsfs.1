@@ -42,6 +42,18 @@ tsfs \- time-aware storage filesystem: FUSE mount with retention policies and a 
 .B \-\-dry\-run
 |
 .B \-\-status
+|
+.B \-\-stats
+.YS
+.SY tsfs
+.RB [ \-c
+.IR path ]
+.RB [ \-m
+.IR path ]
+.RB [ \-b
+.IR path ]
+.B \-\-purge
+.RB [ \-\-force | \-\-dry\-run ]
 .YS
 .SY tsfs
 .B \-\-print\-example\-config
@@ -105,6 +117,35 @@ The configuration is reloaded without remounting on
 .B SIGHUP
 and when the configuration file changes.
 .PP
+With
+.B filesystem.retention_xattrs
+(the default), every regular file of the mount has four read-only virtual
+extended attributes:
+.B user.tsfs.state
+.RB ( expires ", " expired ", " excluded " or " never ),
+.B user.tsfs.expires
+(expiry in ISO 8601 UTC, only when the file expires),
+.B user.tsfs.rule
+(identifier of the deciding rule, or
+.BR default )
+and
+.B user.tsfs.created
+(birth time of the backing file in ISO 8601 UTC, or its modification time when the
+backing filesystem does not report it).
+They are read by name, for example
+.BR "getfattr \-n user.tsfs.state" " \fIFILE\fR,"
+and are not returned by
+.BR listxattr (2),
+so that
+.BR ls (1)
+does not mark every file with a
+.BR + .
+Other attribute names fail with
+.BR ENODATA ;
+the attributes cannot be set or removed.
+.BR tsfs\-ls (1)
+displays them.
+.PP
 Paths in retention rules are relative to the TSFS root:
 .I /tmp/record
 designates
@@ -136,6 +177,72 @@ Raise that setting to list them all.
 .B \-\-status
 Print the status file of the running daemon
 .RB ( metrics.status_file ).
+.TP
+.B \-\-stats
+Scan the backing directory once and print, per rule that decides at least one
+file (in configuration order,
+.B default
+for
+.BR retention.default ),
+the number of regular files and their size, how many are expired now, expire
+within 24 hours, are excluded, or are kept forever
+.RB ( never ),
+and the next expiry (UTC); then a
+.B TOTAL
+row and the counts of directories, symbolic links, other entries, unreadable
+entries and mount boundaries.
+Needs read access to the whole backing tree.
+.TP
+.B \-\-purge
+Delete now every file that is already expired, ignoring
+.B garbage_collector.max_deletions_per_second
+and
+.BR max_deletions_per_cycle ,
+with the usual validation of each file; excluded and
+.B never
+files are never touched.
+Complete passes are repeated while the scheduler saturates, so a backlog larger
+than
+.B max_pending_tasks
+is purged too.
+Works with
+.BR "garbage_collector.enabled: false" .
+When a daemon serves the mount point (found through
+.BR metrics.status_file :
+live pid, process named
+.BR tsfs ,
+same mount point), it is sent
+.B SIGUSR2
+and does the purge; the command waits for the result in the status file and prints
+.RI "purge: " N " file(s) deleted (" SIZE "), " F " failed, " O " kept because open through the mount" .
+When the mount point is not mounted, this process purges the backing directory
+itself.
+When it is mounted but its daemon cannot be found, the purge is refused (status 7):
+files open through the mount would not be protected; send
+.B SIGUSR2
+to the daemon instead.
+With
+.BR "garbage_collector.dry_run: true" ,
+it is refused (status 7).
+On a terminal, it asks for confirmation
+.RB ( [y/N] ).
+Exits with status 1 if a deletion failed.
+.TP
+.B \-\-force
+With
+.BR \-\-purge :
+do not ask for confirmation.
+Required when standard input is not a terminal (otherwise status 2).
+Rejected with any other action and with
+.B \-\-purge \-\-dry\-run
+(status 2).
+.PP
+.B \-\-purge \-\-dry\-run
+(or
+.BR "\-\-dry\-run \-\-purge" )
+previews the purge: it prints exactly the
+.B \-\-dry\-run
+listing.
 .TP
 .B \-\-print\-example\-config
 Print the commented example configuration.
@@ -230,12 +337,27 @@ Write the status file immediately and log a
 .B status_requested
 summary.
 .TP
+.B SIGUSR2
+Purge: delete every expired file now, without rate limit (see
+.BR \-\-purge ).
+Logged as
+.BR gc_purge_requested ", " gc_purge_started " and " gc_purge_completed .
+Can be sent directly, for example
+.B "systemctl kill \-s USR2 tsfs@NAME"
+or
+.BR "kill \-USR2" " \fIPID\fR."
+.TP
 .BR SIGTERM ", " SIGINT
 Stop the garbage collector, write a final status file, unmount the filesystem and
 exit with status 0.
 Unmounting the mount point externally
 .RB ( umount ", " "fusermount3 \-u" )
 has the same effect.
+.PP
+These signals are blocked from the very start of the daemon: one received during
+startup is handled as soon as the filesystem serves requests (a
+.B SIGTERM
+then unmounts cleanly and exits with status 0).
 .SH FILES
 .TP
 .I /etc/tsfs/config.yml
@@ -296,7 +418,37 @@ Default status file
 .RB ( metrics.status_file ),
 a JSON document rewritten periodically, on
 .BR SIGUSR1 ,
-and at shutdown.
+when a purge starts or ends, and at shutdown.
+.B \-\-purge
+reads it to find the daemon.
+.TP
+.I /sys/fs/fuse/connections/ID
+Kernel control directory of the FUSE connection of the mount (fusectl;
+.I ID
+is the device number of the mount,
+.BR "stat \-c %d" " \fIMOUNTPOINT\fR)."
+Its
+.I waiting
+file (requests not answered yet by the daemon) is copied into the
+.B fuse
+section of the status file;
+.I abort
+fails every pending request as a last resort.
+.TP
+.IR /usr/bin/ls ", " /usr/bin/ls.orig
+By default, a root installation renames the system
+.B ls
+to
+.I ls.orig
+and installs the wrapper
+.BR tsfs\-ls (1)
+as
+.IR /usr/bin/ls ;
+the
+.B uninstall
+target renames
+.I ls.orig
+back.
 .TP
 .I tsfs.service
 systemd unit (installed disabled) that runs
@@ -309,10 +461,16 @@ and reloads with
 Success.
 .TP
 .B 1
-Runtime error.
+Runtime error;
+.BR \-\-purge :
+at least one deletion failed, or the daemon stopped during the purge.
 .TP
 .B 2
-Usage error (unknown option, incompatible options).
+Usage error (unknown option, incompatible options,
+.B \-\-purge
+without
+.B \-\-force
+when standard input is not a terminal).
 .TP
 .B 3
 Insufficient privileges:
@@ -322,7 +480,10 @@ is not accessible, or
 is set for a non-root daemon without
 .B user_allow_other
 in
-.IR /etc/fuse.conf .
+.IR /etc/fuse.conf ;
+or
+.B \-\-purge
+cannot signal the daemon.
 .TP
 .B 4
 Missing dependency (for example
@@ -341,7 +502,10 @@ values).
 .B 7
 Unexpected system state (missing backing directory or mount point, unwritable log
 file, mount failure, no status file for
-.BR \-\-status ).
+.BR \-\-status ,
+purge refused because
+.B garbage_collector.dry_run
+is true or because the mount point is mounted without a reachable daemon).
 .SH EXAMPLES
 Validate a configuration and print it with every default:
 .PP
@@ -357,6 +521,24 @@ List the files the policy would delete now, without deleting anything:
 .in +4n
 .EX
 sudo tsfs \-\-dry\-run \-c /etc/tsfs/config.yml
+.EE
+.in
+.PP
+Count the files per rule, then delete every expired file now:
+.PP
+.in +4n
+.EX
+sudo tsfs \-\-stats \-c /etc/tsfs/config.yml
+sudo tsfs \-\-purge \-c /etc/tsfs/config.yml          # asks [y/N]
+sudo tsfs \-\-purge \-\-force \-c /etc/tsfs/config.yml  # scripts
+.EE
+.in
+.PP
+Read the retention of a file through the mount:
+.PP
+.in +4n
+.EX
+getfattr \-n user.tsfs.expires /mnt/tsfs/tmp/record/a.mp4
 .EE
 .in
 .PP
@@ -406,6 +588,8 @@ sudo systemctl stop tsfs        # or: sudo umount /mnt/tsfs
 .EE
 .in
 .SH SEE ALSO
+.BR tsfs\-ls (1),
+.BR getfattr (1),
 .BR fusermount3 (1),
 .BR mount.fuse3 (8),
 .BR systemctl (1),

@@ -8,6 +8,8 @@
 # Copyright (c) 2026 Thierry Gayet. SPDX-License-Identifier: 0BSD
 # =============================================================================
 # Every package comes from the Ubuntu archive: the image needs no download script.
+# libclang-rt-dev: the sanitizer runtimes of Clang (Debug builds use ASan + UBSan by
+# default, the clang preset included).
 # The FUSE integration tests need the container to be started with
 #   --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined
 # which scripts/tsfs-dev.sh does.
@@ -16,6 +18,7 @@ FROM ubuntu:26.04
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential g++ g++-16 clang clang-tidy clang-format lld \
+        libclang-rt-dev \
         cmake ninja-build pkg-config ccache git ca-certificates \
         libfuse3-dev fuse3 libyaml-cpp-dev libspdlog-dev libfmt-dev zlib1g-dev \
         libgtest-dev libgmock-dev libbenchmark-dev \

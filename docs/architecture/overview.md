@@ -50,7 +50,7 @@ User-facing material: [user guide](../user/user-guide.md),
  backing directory <--- | fsutil/ BackingStore (root fd, openat2 / fallback walk)              |
                         |                                                                      |
  config.yml ----------> | config/ ConfigWatcher -> ConfigManager -> observers (logger, GC)     |
- SIGHUP / SIGUSR1 ----> |         (eventfd bridges)                                            |
+ SIGHUP/USR1/USR2 ----> |         (eventfd bridges; USR2 -> GarbageCollector::request_purge)   |
                         | logging/ Logger (spdlog pipeline, RotatingFileSink, LogCompressor)   |
                         | metrics/ status JSON writer        diagnostics/ CrashHandler         |
                         | app/ Daemon (owner, startup/shutdown order)   cli/ argument parsing  |
@@ -62,13 +62,14 @@ User-facing material: [user guide](../user/user-guide.md),
 | `src/app` | `Daemon`, `run_application` (`application.cpp`) | Selects the action; owns every component of the mounted service and the startup/shutdown order. |
 | `src/cli` | `parse_command_line`, `CliOptions`, `ExitCode` | getopt_long parsing, action exclusivity, CLI overrides, usage/version text, the example configuration embedded with `#embed`. |
 | `src/common` | `Result`/`Error`, `UniqueFd`, `Clock`, `managed_path`, units, escape, threads | Shared vocabulary: error values, RAII descriptor, injectable wall clock, managed-path normalization, duration/size parsing, injection-safe string escaping, helper-thread setup. |
-| `src/config` | `Config`, `parse_config`, `ConfigManager`, `ConfigWatcher` | Strict YAML schema (yaml-cpp), immutable snapshots, validated hot reload, inotify/SIGHUP/SIGUSR1 triggers. |
+| `src/config` | `Config`, `parse_config`, `ConfigManager`, `ConfigWatcher` | Strict YAML schema (yaml-cpp), immutable snapshots, validated hot reload, inotify/SIGHUP/SIGUSR1 triggers, SIGUSR2 purge bridge. |
 | `src/policy` | `PolicyEngine`, `Glob`, `Decision` | Compiled retention rules; deterministic precedence; saturating expiry computation. |
-| `src/gc` | `GarbageCollector`, `TreeScanner`, `ExpirationScheduler` (`HeapScheduler`, `OrderedScheduler`), `TokenBucket` | Discovery (time-sliced scans + FUSE notifications), bounded scheduling, validated deletion, retries. |
-| `src/filesystem` | `PassthroughFs`, `FuseSession` | High-level libfuse operation table, mount lifecycle, kernel cache invalidation. |
+| `src/gc` | `GarbageCollector`, `TreeScanner`, `ExpirationScheduler` (`HeapScheduler`, `OrderedScheduler`), `TokenBucket` | Discovery (time-sliced scans + FUSE notifications), bounded scheduling, validated deletion, retries, unthrottled purge. |
+| `src/filesystem` | `PassthroughFs`, `FuseSession`, `fuse_connection_id`, `fuse_connection_waiting` | High-level libfuse operation table (including the read-only retention extended attributes), mount lifecycle, kernel cache invalidation, kernel FUSE connection (fusectl) of the mount. |
 | `src/fsutil` | `BackingStore`, `stat_entry`, `PathLockTable`, `OpenFileRegistry` | Race-resistant access to the backing tree; per-path stripes; open-inode registry. |
 | `src/logging` | `Logger`, `RotatingFileSink`, `LogCompressor`, `NoticeQueue`, `LogRateLimiter` | Structured text/JSON logging, size-based rotation, background gzip, failure reporting without recursion. |
 | `src/metrics` | `ShardedCounters`, `render_status_json`, `write_file_atomically` | Contention-free FUSE counters; status file written atomically. |
+| `src/tools` | `tsfs_ls.cpp` (executable `tsfs-ls`) | Standalone `ls` wrapper (no TSFS library). Every listing is produced by the original `ls` (`ls.orig`): outside TSFS mounts, in pipes and with `TSFS_LS=off` it is run with `execv` and the unchanged command line; inside a TSFS mount on a terminal it is run with `-l --dired` appended after the user's options (before a `--`), and its dired trailer locates each entry, which is tagged with the retention read from the `user.tsfs.*` extended attributes. Installed as the system `ls` by default (`TSFS_REPLACE_SYSTEM_LS`: the system `ls` is renamed `<ls>.orig`). |
 | `src/diagnostics` | `CrashHandler`, `SymbolTable`, `enable_core_dumps` | Async-signal-safe text crash reports with a symbolized backtrace (function symbols of every loaded ELF object, loaded at installation and searched in the signal handler); native core-dump enabling. |
 
 ## 2. Process lifecycle
@@ -81,8 +82,15 @@ exit code 2; options that only apply when mounting (`--foreground`, `--debug`,
 `--fuse-debug`, the diagnostics options) combined with an action are also usage errors
 (exit 2). An exception escaping everything returns 1. One-shot actions
 (`--help`, `--version`, `--print-example-config`, `--check-config`,
-`--show-config`, `--status`, `--dry-run`) return without mounting. The default
-action constructs a `Logger` and a `Daemon` and calls `Daemon::run()`.
+`--show-config`, `--status`, `--dry-run`, `--stats`, `--purge`) return without
+mounting. The default action constructs a `Logger` and a `Daemon` and calls
+`Daemon::run()`.
+
+| Action | Function | Work |
+|---|---|---|
+| `--dry-run` | `action_dry_run` | Standalone `GarbageCollector` (no threads, no open-file registry), one full pass, every due candidate validated with `force_dry_run`; prints the table. |
+| `--stats` | `action_stats` | One `TreeScanner` pass over the backing directory, `PolicyEngine::evaluate` per regular file, per-rule counters (files, bytes, expired, within 24 h, excluded, never, next expiry). |
+| `--purge` | `action_purge` | `--dry-run` with `--purge --dry-run`; otherwise finds the daemon through the status file and sends it `SIGUSR2`, then polls the status file; without a daemon and without a mount, purges offline with a standalone `GarbageCollector` without rate limits. See [garbage-collector.md](garbage-collector.md#15-purge-tsfs---purge-sigusr2). |
 
 Exit codes (`src/cli/command_line.hpp`): 0 ok, 1 runtime, 2 usage, 3
 privileges (mount preflight: `/dev/fuse` not accessible, or `allow_other` without
@@ -94,22 +102,23 @@ configuration file and invalid `-m`/`-b` overrides), 7 unexpected system state.
 
 | Step | Code | Failure |
 |---|---|---|
+| 0a. Block SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGPIPE in the main thread, first of all: a signal received during startup stays pending (instead of killing the daemon, possibly after the mount, leaving a dead mount) and is handled when the loop starts; helper threads inherit the mask. | `pthread_sigmask` | |
 | 0. `umask(0)`: the kernel already applied the client's umask to entries created through the mount; every file the daemon creates for itself has an explicit mode. | `::umask` | |
 | 1. Load the configuration (file trust check: a root daemon requires a root-owned file not writable by group or others), validate it, apply and validate the CLI overrides, compile the policy (generation 1). | `ConfigManager::load_initial` | exit 5 |
 | 2. Preflight: log directory/file creatable (if `logging.enabled`). | `RotatingFileSink::check_writable` | exit 7 |
 | 3. Open the backing directory (root descriptor, openat2 probe). | `BackingStore::open` | exit 4 (ENOSYS) or 7 |
 | 4. Mount preflight: `/dev/fuse` readable and writable; `allow_other` needs root or `user_allow_other` in `/etc/fuse.conf`. | `check_mount_privileges` | exit 3 (exit 4 when `/dev/fuse` does not exist) |
-| 4b. Check that the mount point exists and is a directory. | `::stat` | exit 7 |
+| 4b. Check that the mount point exists, is a directory and is not already a mount point. | `check_mount_point` (`statx`, `STATX_ATTR_MOUNT_ROOT`) | exit 7 (exit 3 when access is denied) |
 | 5. Construct `GarbageCollector` and `PassthroughFs` (no thread started). | | |
-| 6. `fuse_new` + `fuse_mount`. | `FuseSession::mount` | exit 7 |
+| 6. `fuse_new` (operation table with or without the xattr callbacks, `filesystem.retention_xattrs`) + `fuse_mount`; then read the FUSE connection identifier of the new mount from `/proc/self/mountinfo` (never a `stat()` of the mount, which would be a request to this daemon whose loop is not running yet). | `FuseSession::mount`, `fuse_connection_id` | exit 7 |
 | 7. `fuse_daemonize(0)` unless `--foreground`. Done before any thread exists because it forks. | | exit 1 |
-| 8. Block SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGPIPE in the main thread so that helper threads inherit the mask. | `pthread_sigmask` | |
+| 8. No helper thread exists yet; the signal mask set at step 0a is inherited by every thread created from now on. | | |
 | 9. Build the real logging pipeline (replaces the stderr bootstrap logger). | `Logger::configure` | exit 7 |
 | 10. Optional diagnostics: crash handler (loads the symbol table), core dumps (failures are logged, not fatal). Events `diagnostics_enabled`, `diagnostics_core_dumps`, `diagnostics_unavailable`. | `CrashHandler::install`, `enable_core_dumps` | warning |
 | 11. Register reload observers: logger first (fallible), then GC. | `ConfigManager::add_observer` | |
 | 12. Create the configuration watcher (eventfds + inotify). | `ConfigWatcher::create` | exit 1 |
-| 13. Install libfuse's signal handlers, then TSFS's SIGHUP/SIGUSR1 handlers. | `FuseSession::install_signal_handlers`, `install_control_signal_handlers` | exit 1 |
-| 14. Publish the session for cache invalidation, start GC, watcher, housekeeping thread. | `gc_->start()`, `watcher->start()`, `std::jthread` | |
+| 13. Install libfuse's signal handlers, then TSFS's SIGHUP/SIGUSR1/SIGUSR2 handlers. | `FuseSession::install_signal_handlers`, `install_control_signal_handlers` | exit 1 |
+| 14. Publish the session for cache invalidation, start GC, watcher, housekeeping thread; log `filesystem_mounted` (with `fuse_control`). | `gc_->start()`, `watcher->start()`, `std::jthread` | |
 | 15. Unblock the async signals in the main thread and run `fuse_loop_mt`. | `FuseSession::loop` | |
 
 Every check that can fail on configuration or environment (steps 1-6) runs
@@ -123,6 +132,7 @@ process detaches.
 | SIGINT, SIGTERM | libfuse (`fuse_set_signal_handlers`) | Ends `fuse_loop_mt`; shutdown follows. |
 | SIGHUP | `on_sighup` (`src/config/config_watcher.cpp`), installed after libfuse's | `write(2)` to the reload eventfd; the watcher thread reloads. |
 | SIGUSR1 | `on_sigusr1` | `write(2)` to the status eventfd; the watcher thread writes the status file and logs `status_requested`. |
+| SIGUSR2 | `on_sigusr2` | `write(2)` to the purge eventfd; the watcher thread logs `gc_purge_requested` and calls `GarbageCollector::request_purge()`; the coordinator runs the purge. |
 | SIGPIPE | libfuse | Ignored by libfuse's handler set. |
 | SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGSYS, SIGTRAP | `fatal_handler` when diagnostics are enabled | Text crash report, then default action. |
 
@@ -142,7 +152,7 @@ immutable snapshot. A failure keeps the previous snapshot. See
 When `fuse_loop_mt` returns (signal, `fusermount3 -u`, or error), the main
 thread re-blocks the async signals and tears the service down in this order:
 
-1. Restore default SIGHUP/SIGUSR1 dispositions (`install_control_signal_handlers(-1, -1)`).
+1. Restore default SIGHUP/SIGUSR1/SIGUSR2 dispositions (`install_control_signal_handlers(-1, -1)`, the purge descriptor defaulting to -1).
 2. Stop and join the configuration watcher (no more reloads).
 3. Stop and join the housekeeping thread.
 4. Clear `live_session_` so the GC stops invalidating kernel caches.
@@ -198,7 +208,7 @@ takes the GC mutex to append to a bounded deque.
   `OpenFileRegistry`, `GarbageCollector`, `PassthroughFs` and `FuseSession`. The
   `Logger` is created by `run_application` and outlives the `Daemon`. There is
   no global logger and no singleton service; the only process-wide state is
-  signal-related (eventfd numbers for the SIGHUP/SIGUSR1 handlers, crash-handler
+  signal-related (eventfd numbers for the SIGHUP/SIGUSR1/SIGUSR2 handlers, crash-handler
   state) and the rate-limited `stderr_fallback()`.
 * **Dependency injection by reference.** `GarbageCollector::Dependencies` and
   `PassthroughFs::Dependencies` hold references; the owner guarantees that the
@@ -270,7 +280,8 @@ not, or only partially, implemented:
   rebuilt by reconciliation. See [metadata.md](metadata.md).
 * **"First observation" lifetime** (spec section 6): not supported; only
   `st_mtime` and statx birth time.
-* **Extended attributes, ioctl, poll, flock/POSIX lock callbacks,
+* **Extended attributes** (other than the four read-only `user.tsfs.*`
+  retention attributes), **ioctl, poll, flock/POSIX lock callbacks,
   copy_file_range**: not implemented (see [filesystem.md](filesystem.md#4-unsupported-operations)).
 
 Explicit assumptions of the design:

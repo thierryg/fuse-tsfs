@@ -14,7 +14,9 @@
 #include "common/escape.hpp"
 #include "common/managed_path.hpp"
 #include "common/units.hpp"
+#include "filesystem/fuse_control.hpp"
 #include "logging/log_field.hpp"
+#include "support/test_support.hpp"
 
 namespace tsfs {
 namespace {
@@ -194,6 +196,33 @@ TEST(LogEvent, JsonRenderingIsValidObjectContent) {
     const LogField fields[] = {{"path", "/x\"y"}, {"ratio", 0.5}};
     EXPECT_EQ(render_event(LogFormat::json, "gc", "e", "", fields),
               "\"component\":\"gc\",\"event\":\"e\",\"path\":\"/x\\\"y\",\"ratio\":0.500");
+}
+
+// --- fusectl connection of a mount ----------------------------------------------
+
+TEST(FuseControl, ConnectionIdComesFromTheTopmostFuseMountOfThePath) {
+    const std::string mountinfo =
+        "22 1 252:1 / / rw,relatime shared:1 - ext4 /dev/mapper/root rw\n"
+        "36 22 0:52 / /mnt/tsfs rw,nosuid,nodev shared:30 - fuse.tsfs tsfs rw,user_id=0,group_id=0\n"
+        "37 22 0:60 / /mnt/with\\040space rw shared:31 master:2 - fuse.tsfs tsfs rw\n"
+        "38 22 0:61 / /mnt/other rw - tmpfs tmpfs rw\n"
+        "39 36 0:70 / /mnt/tsfs rw - fuse tsfs rw\n"  // Stacked: the last one is on top.
+        "40 22 8:3 / /mnt/blk rw - fuseblk dev rw\n";
+    EXPECT_EQ(fuse_connection_id(mountinfo, "/mnt/tsfs"), 70U);
+    EXPECT_EQ(fuse_connection_id(mountinfo, "/mnt/with space"), 60U);
+    EXPECT_FALSE(fuse_connection_id(mountinfo, "/mnt/other").has_value());  // Not FUSE.
+    EXPECT_FALSE(fuse_connection_id(mountinfo, "/mnt/none").has_value());
+    EXPECT_FALSE(fuse_connection_id(mountinfo, "/mnt/blk").has_value());  // fuseblk: not "fuse"/"fuse.*".
+    EXPECT_FALSE(fuse_connection_id("garbage line\n\n", "/mnt/tsfs").has_value());
+    // A non-zero major uses the kernel encoding (major << 20 | minor).
+    EXPECT_EQ(fuse_connection_id("41 22 1:2 / /m rw - fuse.x x rw\n", "/m"), (1U << 20U) | 2U);
+}
+
+TEST(FuseControl, WaitingIsReadFromTheConnectionDirectory) {
+    const test::TempDir dir("tsfs-fusectl");
+    test::write_file(dir / "42/waiting", "3\n");
+    EXPECT_EQ(fuse_connection_waiting(42, dir.path().string()), 3U);
+    EXPECT_FALSE(fuse_connection_waiting(43, dir.path().string()).has_value());  // No such connection.
 }
 
 }  // namespace

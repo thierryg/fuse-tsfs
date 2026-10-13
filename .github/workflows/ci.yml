@@ -34,20 +34,29 @@ jobs:
       matrix:
         step: [format, shell, deps, ci, debug, clang, tidy, tsan, coverage, doc]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Development image
         run: scripts/tsfs-dev.sh --rebuild true
       - name: qa ${{ matrix.step }}
         run: scripts/tsfs-dev.sh --no-aslr scripts/tsfs-qa.sh ${{ matrix.step }}
       - name: Coverage report
         if: matrix.step == 'coverage'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage
           path: build/coverage/coverage/
       - name: API documentation
         if: matrix.step == 'doc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: doxygen-html
           path: build/release/docs/html/
+      - name: Test logs (failure)
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-logs-${{ matrix.step }}
+          path: |
+            build/*/Testing/Temporary/LastTest*.log
+            build/*/test-artifacts/
+          if-no-files-found: ignore

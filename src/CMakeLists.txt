@@ -23,6 +23,7 @@ add_library(tsfs_core STATIC
     config/config_watcher.cpp
     diagnostics/crash_handler.cpp
     diagnostics/symbol_table.cpp
+    filesystem/fuse_control.cpp
     filesystem/fuse_session.cpp
     filesystem/passthrough_fs.cpp
     fsutil/backing_store.cpp
@@ -53,3 +54,9 @@ target_link_libraries(tsfs_core
 
 add_executable(tsfs main.cpp)
 target_link_libraries(tsfs PRIVATE tsfs_core)
+
+# tsfs-ls: standalone (no TSFS library, no daemon dependency); see tools/tsfs_ls.cpp.
+add_executable(tsfs_ls tools/tsfs_ls.cpp)
+set_target_properties(tsfs_ls PROPERTIES OUTPUT_NAME tsfs-ls)
+target_compile_definitions(tsfs_ls PRIVATE TSFS_SYSTEM_LS="${TSFS_SYSTEM_LS}")
+target_link_libraries(tsfs_ls PRIVATE tsfs_options)

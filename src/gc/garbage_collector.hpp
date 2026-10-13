@@ -73,8 +73,14 @@ struct GcStats {
     std::uint64_t skipped_unsafe{0};
     std::uint64_t failed{0};
     std::uint64_t retries{0};
-    std::uint64_t queue_saturations{0};  ///< Candidates rejected by a full scheduler.
-    std::uint64_t events_dropped{0};     ///< FUSE notifications dropped (event queue full).
+    std::uint64_t queue_saturations{0};   ///< Candidates rejected by a full scheduler.
+    std::uint64_t purges_completed{0};    ///< request_purge() runs finished.
+    std::uint64_t purging{0};             ///< Gauge: 1 while a purge runs.
+    std::uint64_t last_purge_deleted{0};  ///< Result of the last completed purge.
+    std::uint64_t last_purge_bytes{0};
+    std::uint64_t last_purge_failed{0};
+    std::uint64_t last_purge_skipped_open{0};
+    std::uint64_t events_dropped{0};  ///< FUSE notifications dropped (event queue full).
     std::uint64_t scans_completed{0};
     std::uint64_t last_scan_files{0};  ///< Regular files seen by the last complete pass.
     std::uint64_t last_scan_duration_ms{0};
@@ -150,6 +156,19 @@ public:
     /// Triggers a new reconciliation pass so every file is re-evaluated.
     void apply(std::shared_ptr<const GcSnapshot> snapshot);
 
+    /**
+     * @brief Delete now every file that is already expired (tsfs --purge, SIGUSR2).
+     *
+     * The coordinator runs complete reconciliation passes and hands every due
+     * candidate to the workers without rate limit (max_deletions_per_second) or
+     * cycle budget (max_deletions_per_cycle), with the usual validation of each file
+     * (identity, open handles, current policy...): excluded and "never" files are
+     * never touched, and garbage_collector.dry_run still prevents any deletion.
+     * Passes are repeated while the bounded scheduler saturates, so a backlog larger
+     * than max_pending_tasks is purged too. Works with the GC disabled. Non-blocking;
+     * completion increments GcStats::purges_completed. Thread-safe.
+     */
+    void request_purge();
     /// A file was created/written/renamed-to/truncated through the mount (non-blocking).
     void notify_changed(std::string_view path);
 
@@ -173,7 +192,8 @@ private:
     void stop_workers();
     void evaluate_and_schedule(std::string_view path, const EntryStat& stat, const GcSnapshot& snap, TimePoint now);
     void drain_events(const GcSnapshot& snap);
-    std::size_t dispatch_due(const GcSnapshot& snap);
+    std::size_t dispatch_due(const GcSnapshot& snap, bool unlimited = false);
+    void run_purge(const GcSnapshot& snap, std::stop_token stop);
     void handle_outcome(GcCandidate& candidate, GcOutcome outcome, const GcSnapshot& snap, int error);
     void schedule(GcCandidate candidate);
     void report_failure(std::string_view event, std::string_view path, int error, std::string_view message);
@@ -207,7 +227,9 @@ private:
     std::jthread coordinator_thread_;
     mutable std::mutex workers_mutex_;  ///< Guards workers_ (start/stop/apply may race).
     std::vector<std::jthread> workers_;
-    bool wake_{false};  ///< Coordinator wake-up flag (guarded by mutex_).
+    bool wake_{false};                  ///< Coordinator wake-up flag (guarded by mutex_).
+    bool purge_requested_{false};       ///< Guarded by mutex_.
+    std::atomic<bool> purging_{false};  ///< Workers skip the token bucket while set.
     std::atomic<bool> running_{false};
 
     // Counters (relaxed atomics: written by a handful of threads at deletion rate).
@@ -215,7 +237,8 @@ private:
         std::atomic<std::uint64_t> candidates{0}, deleted{0}, bytes_deleted{0}, would_delete{0}, vanished{0},
             skipped_modified{0}, skipped_replaced{0}, skipped_open{0}, skipped_unsafe{0}, failed{0}, retries{0},
             queue_saturations{0}, events_dropped{0}, scans_completed{0}, last_scan_files{0}, last_scan_duration_ms{0},
-            scan_time_ms{0}, delete_time_us{0}, worker_busy_us{0};
+            scan_time_ms{0}, delete_time_us{0}, worker_busy_us{0}, purges_completed{0}, last_purge_deleted{0},
+            last_purge_bytes{0}, last_purge_failed{0}, last_purge_skipped_open{0};
         std::atomic<std::int64_t> last_scan_completed_unix_ms{0};
     };
     mutable Counters counters_;

@@ -295,6 +295,26 @@ TEST(CommandLine, DiagnosticsOptions) {
     EXPECT_TRUE(*r->overrides.native_core_dump);
 }
 
+TEST(CommandLine, PurgeStatsAndPreview) {
+    auto r = cli({"--purge"});
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->action, CliAction::purge);
+    EXPECT_FALSE(r->force);
+    EXPECT_FALSE(r->purge_preview);
+    r = cli({"--purge", "--force"});
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->force);
+    for (const auto& args : std::vector<std::vector<std::string>>{{"--purge", "--dry-run"}, {"--dry-run", "--purge"}}) {
+        r = cli(args);
+        ASSERT_TRUE(r.has_value()) << args.front();
+        EXPECT_EQ(r->action, CliAction::purge);
+        EXPECT_TRUE(r->purge_preview);
+    }
+    r = cli({"--stats", "-c", "/etc/x.yml"});
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->action, CliAction::stats);
+}
+
 TEST(CommandLine, UsageErrors) {
     for (const auto& args : std::vector<std::vector<std::string>>{{"--bogus"},
                                                                   {"-c"},
@@ -304,6 +324,10 @@ TEST(CommandLine, UsageErrors) {
                                                                   {"--dry-run", "--foreground"},
                                                                   {"--status", "--core-dump"},
                                                                   {"--debug", "--check-config"},
+                                                                  {"--force"},
+                                                                  {"--stats", "--force"},
+                                                                  {"--purge", "--dry-run", "--force"},
+                                                                  {"--purge", "--stats"},
                                                                   {"--version", "--help"}}) {
         const auto r = cli(args);
         ASSERT_FALSE(r.has_value()) << args.front();

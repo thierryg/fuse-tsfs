@@ -143,6 +143,16 @@ It needs `/dev/fuse` and `fusermount3`, works in a private work directory remove
 end, always unmounts on exit, and prints an environment header (section 5) before the
 JSON lines. Exit codes: 0, 1 (runtime), 2 (usage), 4 (missing dependency).
 
+The mounts use the default `filesystem.retention_xattrs: true`, so every write
+request costs one extra `getxattr` round trip (`security.capability`). To measure
+that cost, compare runs on the same storage with the setting `true` and `false`
+(the script has no option for it: add `retention_xattrs: false` to the `filesystem`
+section written by `write_config()` in a local copy), and read the `getxattr` and `write`
+counters of the status file: they are equal under a write workload. Reference A/B
+result (3 runs each, medians): small-file create + write -28 %, large sequential
+writes and concurrent creates unchanged within noise
+([benchmark report](../performance/benchmark-report.md#8-retention-extended-attributes-cost)).
+
 ## 3. Running the benchmarks
 
 Benchmarks are meaningful only in an optimized build. Use the `release` tree (or

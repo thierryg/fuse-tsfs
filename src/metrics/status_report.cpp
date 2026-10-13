@@ -19,6 +19,7 @@
 #include <iterator>
 
 #include "common/escape.hpp"
+#include "filesystem/fuse_control.hpp"
 
 namespace tsfs {
 namespace {
@@ -41,19 +42,21 @@ std::string render_status_json(const StatusInputs& in) {
     std::format_to(it, "  \"config\": {{\"generation\": {}, \"reloads\": {}, \"reload_failures\": {}}},\n",
                    in.config_generation, in.config_reloads, in.config_reload_failures);
     const GcStats& g = in.gc;
-    std::format_to(it,
-                   "  \"gc\": {{\"candidates\": {}, \"deleted\": {}, \"bytes_deleted\": {}, \"would_delete\": {}, "
-                   "\"vanished\": {}, \"skipped_modified\": {}, \"skipped_replaced\": {}, \"skipped_open\": {}, "
-                   "\"skipped_unsafe\": {}, \"failed\": {}, \"retries\": {}, \"queue_saturations\": {}, "
-                   "\"events_dropped\": {}, \"scans_completed\": {}, \"managed_files\": {}, "
-                   "\"last_scan_duration_ms\": {}, \"last_reconciliation_unix_ms\": {}, \"scan_time_ms\": {}, "
-                   "\"delete_time_us\": {}, \"worker_busy_us\": {}, \"scheduled\": {}, \"pending_work\": {}, "
-                   "\"workers\": {}}},\n",
-                   g.candidates, g.deleted, g.bytes_deleted, g.would_delete, g.vanished, g.skipped_modified,
-                   g.skipped_replaced, g.skipped_open, g.skipped_unsafe, g.failed, g.retries, g.queue_saturations,
-                   g.events_dropped, g.scans_completed, g.last_scan_files, g.last_scan_duration_ms,
-                   g.last_scan_completed_unix_ms, g.scan_time_ms, g.delete_time_us, g.worker_busy_us, g.scheduled,
-                   g.pending_work, g.workers);
+    std::format_to(
+        it,
+        "  \"gc\": {{\"candidates\": {}, \"deleted\": {}, \"bytes_deleted\": {}, \"would_delete\": {}, "
+        "\"vanished\": {}, \"skipped_modified\": {}, \"skipped_replaced\": {}, \"skipped_open\": {}, "
+        "\"skipped_unsafe\": {}, \"failed\": {}, \"retries\": {}, \"queue_saturations\": {}, "
+        "\"events_dropped\": {}, \"scans_completed\": {}, \"managed_files\": {}, "
+        "\"last_scan_duration_ms\": {}, \"last_reconciliation_unix_ms\": {}, \"scan_time_ms\": {}, "
+        "\"delete_time_us\": {}, \"worker_busy_us\": {}, \"scheduled\": {}, \"pending_work\": {}, "
+        "\"workers\": {}, \"purges_completed\": {}, \"purging\": {}, "
+        "\"last_purge\": {{\"deleted\": {}, \"bytes_deleted\": {}, \"failed\": {}, \"skipped_open\": {}}}}},\n",
+        g.candidates, g.deleted, g.bytes_deleted, g.would_delete, g.vanished, g.skipped_modified, g.skipped_replaced,
+        g.skipped_open, g.skipped_unsafe, g.failed, g.retries, g.queue_saturations, g.events_dropped, g.scans_completed,
+        g.last_scan_files, g.last_scan_duration_ms, g.last_scan_completed_unix_ms, g.scan_time_ms, g.delete_time_us,
+        g.worker_busy_us, g.scheduled, g.pending_work, g.workers, g.purges_completed, g.purging, g.last_purge_deleted,
+        g.last_purge_bytes, g.last_purge_failed, g.last_purge_skipped_open);
     out += "  \"filesystem\": {\"operations\": {";
     for (std::size_t i = 0; i < kFsOpCount; ++i) {
         std::format_to(it, "{}\"{}\": {{\"calls\": {}, \"errors\": {}}}", i == 0 ? "" : ", ",
@@ -61,6 +64,13 @@ std::string render_status_json(const StatusInputs& in) {
     }
     std::format_to(it, "}}, \"bytes_read\": {}, \"bytes_written\": {}, \"open_handles\": {}}},\n", in.fs.bytes_read,
                    in.fs.bytes_written, in.fs.open_handles);
+    // The kernel side of the mount: /sys/fs/fuse/connections/<id>/ (fusectl).
+    const auto json_or_null = [](const auto& value) { return value ? std::format("{}", *value) : std::string("null"); };
+    std::format_to(it, "  \"fuse\": {{\"connection_id\": {}, \"control_dir\": {}, \"waiting\": {}}},\n",
+                   json_or_null(in.fuse_connection),
+                   in.fuse_connection ? json_string(std::format("{}/{}", kFuseConnectionsDir, *in.fuse_connection))
+                                      : std::string("null"),
+                   json_or_null(in.fuse_waiting));
     const LoggerStats& l = in.logging;
     std::format_to(it,
                    "  \"logging\": {{\"queue_overruns\": {}, \"lost_writes\": {}, \"rotations\": {}, "

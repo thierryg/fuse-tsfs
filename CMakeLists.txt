@@ -28,6 +28,10 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# TSFS uses no C++20 modules: no dependency scanning. Besides saving build time, this
+# keeps compile_commands.json free of "@<file>.modmap" arguments that only exist after
+# a build (clang-tidy on a configured-only tree would fail on them).
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
 
 # --- options -------------------------------------------------------------------
@@ -48,6 +52,8 @@ endif()
 set(TSFS_SANITIZE "${_tsfs_default_sanitize}" CACHE STRING
     "Sanitizers: 'address;undefined' (Debug default), 'address', 'undefined', 'thread' or 'none'")
 set(TSFS_DEFAULT_CONFIG_PATH "/etc/tsfs/config.yml" CACHE STRING "Configuration file used without --config")
+set(TSFS_SYSTEM_LS "/usr/bin/ls" CACHE FILEPATH "The system ls wrapped by tsfs-ls (renamed <path>.orig at installation)")
+option(TSFS_REPLACE_SYSTEM_LS "At installation, rename the system ls to <ls>.orig and install the tsfs-ls wrapper as ls" ON)
 set(TSFS_DEPS_PROFILES "build;test" CACHE STRING
     "Feature sets checked by the deps target: build, test, doc, coverage, bench, diagnostics, qa")
 
@@ -79,7 +85,7 @@ include(Coverage)
 
 add_subdirectory(src)
 
-set(TSFS_BUILD_TARGETS tsfs)
+set(TSFS_BUILD_TARGETS tsfs tsfs_ls)
 if(TSFS_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "common/error.hpp"
@@ -32,6 +33,8 @@ struct StatusInputs {
     std::uint64_t config_reload_failures{0};
     GcStats gc;
     FsStats fs;
+    std::optional<std::uint32_t> fuse_connection;  ///< fusectl id, nullopt before mounting.
+    std::optional<std::uint64_t> fuse_waiting;     ///< Unanswered kernel requests (fusectl).
     LoggerStats logging;
 };
 
@@ -41,7 +44,8 @@ struct StatusInputs {
  * Schema (stable keys, documented in docs/user/monitoring.md): "version", "pid",
  * "uptime_s", "mountpoint", "backing_directory", "config" {generation, reloads,
  * reload_failures}, "gc" {...GcStats}, "filesystem" {"operations": {op: {calls,
- * errors}}, bytes_read, bytes_written, open_handles}, "logging" {...}.
+ * errors}}, bytes_read, bytes_written, open_handles}, "fuse" {connection_id,
+ * control_dir, waiting} (null when unknown), "logging" {...}.
  */
 std::string render_status_json(const StatusInputs& inputs);
 

@@ -90,6 +90,9 @@ struct FilesystemConfig {
     FilesystemMode mode{FilesystemMode::passthrough};
     bool allow_other{false};
     bool read_only{false};
+    /// Read-only "user.tsfs.*" extended attributes (retention of each file, used by
+    /// tsfs-ls). Costs one FUSE round trip per write (security.capability lookup).
+    bool retention_xattrs{true};
 };
 
 /// "garbage_collector" section (reloadable).

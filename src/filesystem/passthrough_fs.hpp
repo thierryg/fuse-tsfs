@@ -25,6 +25,7 @@
 #include "logging/logger.hpp"
 #include "logging/rate_limiter.hpp"
 #include "metrics/sharded_counter.hpp"
+#include "policy/policy_engine.hpp"
 
 namespace tsfs {
 
@@ -58,6 +59,8 @@ enum class FsOp : std::uint8_t {
     utimens,
     fallocate,
     lseek,
+    getxattr,
+    listxattr,
     count_
 };
 inline constexpr std::size_t kFsOpCount = static_cast<std::size_t>(FsOp::count_);
@@ -112,6 +115,9 @@ public:
         /// Retention notification (GarbageCollector::notify_changed); may be empty.
         std::function<void(std::string_view path)> on_changed;
         bool read_only{false};
+        /// Current retention policy, for the read-only "user.tsfs.*" extended
+        /// attributes; may be empty (no attribute is then reported).
+        std::function<std::shared_ptr<const PolicyEngine>()> policy;
     };
 
     explicit PassthroughFs(Dependencies deps);
@@ -123,7 +129,8 @@ public:
     PassthroughFs& operator=(const PassthroughFs&) = delete("owns the open handles");
 
     /// @return the libfuse operation table (trampolines to the instance in private_data).
-    static const fuse_operations& operations() noexcept;
+    /// @param with_xattrs Register getxattr/listxattr (filesystem.retention_xattrs).
+    static const fuse_operations& operations(bool with_xattrs = true) noexcept;
 
     [[nodiscard]] FsStats stats() const;
 
@@ -157,6 +164,21 @@ public:
     int create(const char* path, mode_t mode, fuse_file_info* fi);
     int utimens(const char* path, const struct timespec tv[2], fuse_file_info* fi);
     int fallocate(const char* path, int mode, off_t offset, off_t length, fuse_file_info* fi);
+    /**
+     * @brief Read-only virtual extended attributes describing the retention of a
+     *        regular file, computed from the current policy and fresh timestamps:
+     *        "user.tsfs.state" (expires, expired, excluded, never),
+     *        "user.tsfs.expires" (ISO 8601 UTC, only when the file expires) and
+     *        "user.tsfs.rule" (deciding rule id, or "default") and "user.tsfs.created"
+     *        (ISO 8601 UTC birth time, or st_mtime when the backing filesystem does not
+     *        report it).
+     * Every other name answers ENODATA without touching the disk (the kernel asks for
+     * security.capability on writes). Real extended attributes of the backing files
+     * are not exposed, and setxattr/removexattr stay unsupported.
+     */
+    int getxattr(const char* path, const char* name, char* value, size_t size);
+    /// Lists no name (see the implementation: GNU ls would show a "+" for every file).
+    int listxattr(const char* path, char* list, size_t size);
     off_t lseek(const char* path, off_t offset, int whence, fuse_file_info* fi);
 
     /// Account a call (used by the trampolines).

@@ -40,7 +40,8 @@ public:
         std::string mountpoint;
         bool allow_other{false};
         bool read_only{false};
-        bool fuse_debug{false};  ///< libfuse "-d": prints every request on stderr.
+        bool fuse_debug{false};       ///< libfuse "-d": prints every request on stderr.
+        bool retention_xattrs{true};  ///< filesystem.retention_xattrs.
     };
 
     /// Create and mount. @return the session, or EIO/EINVAL with libfuse's reason on stderr.

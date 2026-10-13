@@ -35,6 +35,8 @@ filesystem:
   allow_other: false           # let other users access the mount (needs user_allow_other
                                # in /etc/fuse.conf when not running as root)
   read_only: false             # mount read-only (the GC still deletes expired files)
+  retention_xattrs: true       # user.tsfs.state/expires/rule attributes (tsfs-ls); false saves
+                               # one FUSE round trip per write (restart required)
 
 retention:
   # Lifetime of files matched by no rule. "never" (the default) keeps them forever.

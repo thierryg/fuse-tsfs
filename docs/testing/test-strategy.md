@@ -30,7 +30,7 @@ at every level, from unit tests to stress tests:
 
 ```
                  /\      stress (2)         churn + reloads, scheduler at scale
-                /  \     filesystem (21)    real daemon, real FUSE mount, signals
+                /  \     filesystem (22)    real daemon, real FUSE mount, signals
                /    \    diagnostics (10)   crash reports in isolated subprocesses
               /------\   gc (28), reload (10), logging (20), security (14)
              /        \     component tests on real temporary trees, threads
@@ -38,11 +38,11 @@ at every level, from unit tests to stress tests:
                             scheduler, token bucket, locks, registry
 ```
 
-The total is **196 test cases** in 11 GoogleTest executables, all registered in CTest
+The total is **199 test cases** in 11 GoogleTest executables, all registered in CTest
 through `gtest_discover_tests` (`DISCOVERY_MODE PRE_TEST`):
 
 ```sh
-scripts/tsfs-dev.sh ctest --test-dir build/debug -N | tail -3     # ... Total Tests: 196
+scripts/tsfs-dev.sh ctest --test-dir build/debug -N | tail -3     # ... Total Tests: 199
 ```
 
 Most component tests run on real directories and real system calls rather than mocks.
@@ -55,16 +55,16 @@ Every executable is declared in `tests/CMakeLists.txt` with `tsfs_add_test()`.
 
 | Executable | Source | Labels (declared) | Tests | Covers |
 |---|---|---|---|---|
-| `tsfs_unit_tests` | `tests/unit/test_common.cpp` | unit | 19 | Duration and size parsing and formatting (units, overflow, round trips). `ManagedPath` normalization, traversal and NUL rejection, component-wise `is_within`. Log escaping (newlines, quotes, control bytes, invalid UTF-8, JSON). Log event rendering. |
+| `tsfs_unit_tests` | `tests/unit/test_common.cpp` | unit | 21 | fusectl connection identifier parsed from `/proc/self/mountinfo` (escaped paths, stacked mounts, non-FUSE mounts) and the `waiting` reader. Duration and size parsing and formatting (units, overflow, round trips). `ManagedPath` normalization, traversal and NUL rejection, component-wise `is_within`. Log escaping (newlines, quotes, control bytes, invalid UTF-8, JSON). Log event rendering. |
 | `tsfs_policy_tests` | `tests/policy/test_policy.cpp` | unit, policy | 27 | Glob engine (wildcards, classes, escapes, UTF-8, `*` versus `**`, invalid patterns). Policy precedence (exclusion always wins, then priority, scope specificity, recursion, pattern literals, declaration order). Extension and exact-file rules. `never`. Birth-time fallback. Saturating expiry. Future mtimes. |
-| `tsfs_config_tests` | `tests/config/test_config.cpp` | unit, config | 23 | Safe defaults. The shipped example is valid. YAML errors with line and column. Unknown and duplicate keys. Invalid durations, sizes, paths, rules and GC settings. Logging settings. Dump and parse round trip. Configuration file trust (a root daemon requires a root-owned file not writable by group or others; an unprivileged daemon only needs a regular file). `-m`/`-b` overrides validated like file values. Missing file errno. Command-line parsing, usage errors, and `--help` documenting every option. |
-| `tsfs_reload_tests` | `tests/config/test_reload.cpp` | config, reload, concurrency | 10 | New generation on success. A failed reload keeps the previous configuration. Consecutive reloads. Restart-only settings. Observer failure aborts publication. CLI overrides survive. Concurrent reloads and readers. inotify detection of atomic replacement (no-ops ignored). `SIGHUP` bridge. Re-watch after the directory is recreated. |
+| `tsfs_config_tests` | `tests/config/test_config.cpp` | unit, config | 24 | Safe defaults. The shipped example is valid. YAML errors with line and column. Unknown and duplicate keys. Invalid durations, sizes, paths, rules and GC settings. Logging settings. Dump and parse round trip. Configuration file trust (a root daemon requires a root-owned file not writable by group or others; an unprivileged daemon only needs a regular file). `-m`/`-b` overrides validated like file values. Missing file errno. Command-line parsing (including `--purge`, `--purge --force`, `--purge --dry-run` and `--dry-run --purge` as a preview, `--stats`), usage errors (`--force` alone, with `--stats` or with a preview), and `--help` documenting every option. |
+| `tsfs_reload_tests` | `tests/config/test_reload.cpp` | config, reload, concurrency | 10 | New generation on success. A failed reload keeps the previous configuration. Consecutive reloads. Restart-only settings. Observer failure aborts publication. CLI overrides survive. Concurrent reloads and readers. inotify detection of atomic replacement (no-ops ignored). `SIGHUP`, `SIGUSR1` and `SIGUSR2` bridges. Re-watch after the directory is recreated. |
 | `tsfs_scheduler_tests` | `tests/gc/test_scheduler.cpp` | unit, gc, concurrency | 22 | Both scheduler strategies (heap, ordered; 7 parameterized cases each): due order, exact due time, reschedule, cancel, capacity, `pop` max, randomized comparison with a reference model. Heap tombstone compaction. Token bucket (unlimited, rate, stop). Log rate limiter. Sharded counters. Open-file registry. No deadlock between ancestor locks and pair locks. |
-| `tsfs_gc_tests` | `tests/gc/test_garbage_collector.cpp` | gc, concurrency, security | 28 | Deletion at, before and after expiry. Dry run (from the API and from the configuration). Modified, replaced, renamed and externally deleted files. Open files. Exclusion added by reload. Clock step backwards. Permission failures retried, then abandoned. Symbolic links never followed. Directory swapped for a link. Hard links. Queue saturation and recovery. Restart without state. Threaded pipeline. Notifications. Rate and per-cycle limits. Disabled GC. Fast shutdown. Worker count reload. Concurrent creation never loses fresh files. |
+| `tsfs_gc_tests` | `tests/gc/test_garbage_collector.cpp` | gc, concurrency, security | 30 | Deletion at, before and after expiry. Dry run (from the API and from the configuration). Modified, replaced, renamed and externally deleted files. Open files. Exclusion added by reload. Clock step backwards. Permission failures retried, then abandoned. Symbolic links never followed. Directory swapped for a link. Hard links. Queue saturation and recovery. Restart without state. Threaded pipeline. Notifications. Rate and per-cycle limits. Disabled GC. Fast shutdown. Worker count reload. Concurrent creation never loses fresh files. Purge: every expired file at once despite a rate of 1/s, a cycle budget and a scheduler smaller than the backlog (several passes), excluded and young files kept; purge with the GC disabled, and `dry_run` honored (nothing deleted, `would_delete` counted). |
 | `tsfs_logging_tests` | `tests/logging/test_logging.cpp` | logging, concurrency | 20 | Directory and file creation. Line format. Levels and runtime filtering. JSON lines. Rotation and `max_files`. Rotation disabled. Logging disabled. Concurrent writers with rotation (block policy loses nothing). `discard_new` and `overrun_oldest` policies. Flush on shutdown. Reconfiguration and failed reconfiguration. Permission errors. Active file deleted or replaced externally. Verified compression and compression failure. Repair after an interrupted rotation. Disk full (`RLIMIT_FSIZE`) without recursion or crash. |
 | `tsfs_diagnostics_tests` | `tests/diagnostics/test_diagnostics.cpp` | diagnostics | 10 | Symbol table of the running process (a TSFS function of the executable and a libc function resolved, unmapped address rejected). Crash reports for SIGSEGV, SIGABRT (the process still dies with SIGABRT), SIGFPE, stack overflow (alternate stack) and a crash in a helper thread. A normal exit is not disturbed. Old reports are pruned and other files are kept. Core-dump environment inspection. Native core dump (opt-in). |
 | `tsfs_security_tests` | `tests/security/test_backing_store.cpp` | security | 14 | `BackingStore` with openat2 and with the forced fallback walk (6 parameterized cases each): ordinary paths, non-normalized paths, intermediate symbolic links (absolute, relative, nested, `/proc/self/root` magic link), a symbolic link opened as a directory, a final link seen as a link, and a swapped directory. Missing root. openat2 probe. |
-| `tsfs_filesystem_tests` | `tests/filesystem/test_mount.cpp` | filesystem, security, concurrency | 21 | The real `tsfs` binary mounted with FUSE: create, read, write and append; truncate; rename, unlink and directories; `RENAME_NOREPLACE` and `RENAME_EXCHANGE`; large `readdir`; permissions, ownership and timestamps; symbolic and hard links; device nodes refused; `statfs`; large files; concurrent clients; GC through the mount; open file kept until release; `SIGHUP` reload without remount; invalid reload keeps serving; a file bind-mounted from another filesystem is unreachable (`EXDEV`, root only); the mode of a new entry ignores the daemon's umask; clean shutdown (exit 0, unmounted); read-only mount; shutdown with a file and a directory still open (their handles are freed and logged as `filesystem_handles_released`; regression test for a leak found by LeakSanitizer); every test ends with a check that the daemon exited with status 0 and printed no memory error, data race or undefined-behavior report, and that no leak in its LeakSanitizer report was allocated by TSFS code (`classify_leaks()`: the first frame after the allocator, outside the C++ standard library headers; leaks allocated inside libfuse when a session ends with queued requests are recorded as `third_party_leaks_at_exit`, not failures). |
+| `tsfs_filesystem_tests` | `tests/filesystem/test_mount.cpp` | filesystem, security, concurrency | 26 | The real `tsfs` binary mounted with FUSE: create, read, write and append; truncate; rename, unlink and directories; `RENAME_NOREPLACE` and `RENAME_EXCHANGE`; large `readdir`; permissions, ownership and timestamps; symbolic and hard links; device nodes refused; `statfs`; large files; concurrent clients; GC through the mount; open file kept until release; `SIGHUP` reload without remount; invalid reload keeps serving; a file bind-mounted from another filesystem is unreachable (`EXDEV`, root only); the mode of a new entry ignores the daemon's umask; the status file names the FUSE connection (`fuse.connection_id` equal to the mount's device number); a second instance on a mounted mount point is refused (exit 7); `SIGTERM` during startup (10 iterations, as soon as the daemon announces the mount) ends in a clean unmount with exit 0; retention extended attributes (`user.tsfs.state`, `.rule`, `.expires` for an expiring, an excluded and a `never` file, `.created` as an ISO 8601 UTC value, `ENODATA` for a directory and an unknown name, `setxattr` refused, empty `listxattr`); `tsfs --stats` and `tsfs --purge --force` against the running daemon (20 long-expired files deleted at a rate limit of 1/s, the excluded file kept, `gc_purge_completed` logged); `tsfs-ls` on a terminal (through `script(1)`; skipped without it; `TSFS_REAL_LS=/usr/bin/ls` as the original) tags `ls -l` entries with the retention (`clip.mp4  created ...`, `, filter rec, deleted `, `hold.keep  UNFILTERED`), keeps the meaning of the system `ls` options run through the original (`-R -I '*.keep'` on the mount root hides `hold.keep` and tags `clip.mp4` in the `rec` subdirectory), and in a pipe its output is byte-identical to `/usr/bin/ls -la`; clean shutdown (exit 0, unmounted); read-only mount; shutdown with a file and a directory still open (their handles are freed and logged as `filesystem_handles_released`; regression test for a leak found by LeakSanitizer); every test ends with a check that the daemon exited with status 0 and printed no memory error, data race or undefined-behavior report, and that no leak in its LeakSanitizer report was allocated by TSFS code (`classify_leaks()`: the first frame after the allocator, outside the C++ standard library headers; leaks allocated inside libfuse when a session ends with queued requests are recorded as `third_party_leaks_at_exit`, not failures). |
 | `tsfs_stress_tests` | `tests/stress/test_stress.cpp` | stress | 2 | 8 threads create, rename, rewrite and delete files while the GC runs and the configuration is reloaded every 50 ms. The invariant is that no young file is ever deleted and that all old files are deleted. Separately, 300,000 scheduler operations per strategy. |
 
 Count per suite with, for example:
@@ -84,17 +84,19 @@ escapes the list separators of `LABELS` (and of `ENVIRONMENT`) before passing th
 
 | Label | Tests |
 |---|---|
-| unit | 91 |
+| unit | 94 |
 | policy | 27 |
-| config | 33 |
+| config | 34 |
 | reload | 10 |
-| gc | 50 |
-| concurrency | 101 |
+| gc | 52 |
+| concurrency | 108 |
 | logging | 20 |
 | diagnostics | 10 |
-| security | 63 |
-| filesystem | 21 |
+| security | 70 |
+| filesystem | 26 |
 | stress | 2 |
+
+Total: 206 tests (`ctest -N` in `build/debug`).
 
 ```sh
 scripts/tsfs-dev.sh ctest --test-dir build/debug -L security --output-on-failure
@@ -164,7 +166,11 @@ process.
   root.
 
 `scripts/tsfs-dev.sh` passes `/dev/fuse` and `CAP_SYS_ADMIN` to the container by default.
-`--no-fuse` withholds them, and the 19 mount tests are then skipped.
+`--no-fuse` withholds them, and the 26 mount tests are then skipped.
+`MountTest.TsfsLsShowsRetentionOnATerminalAndDelegatesOtherwise` also needs
+`script(1)` (util-linux, to give `tsfs-ls` a terminal) and `/usr/bin/ls`; it is
+skipped without them. The mount tests depend on the `tsfs` and `tsfs_ls` targets
+(`TSFS_BINARY`, `TSFS_LS_BINARY`).
 
 ## 6. Stress scale
 
@@ -226,8 +232,9 @@ The local quality gate `scripts/tsfs-qa.sh` runs these trees in sequence (steps 
 `debug`, `clang`, `tidy`, `tsan`, `coverage`, among others); see
 [contributing](../developer/contributing.md).
 
-**Status on 2026-10-13:** in the `debug` tree (ASan + LeakSanitizer + UBSan), 194 of the
-196 tests passed and 2 were skipped: the opt-in native core dump test (section 7) and
+**Status on 2026-10-13:** the suite now has 206 tests. In the last recorded full run of
+the `debug` tree (ASan + LeakSanitizer + UBSan), before the purge, statistics, `tsfs-ls`
+and startup-signal tests were added, 197 of the 199 tests passed and 2 were skipped: the opt-in native core dump test (section 7) and
 the root-only bind-mount test (run separately as root). The `clang` and `ci` presets build with `-Werror` and pass the suite.
 
 ## 9. Regression tests for defects found
@@ -241,6 +248,7 @@ would have caught it. Examples fixed on 2026-10-13:
 | The stress test relied on the build being slow enough to saturate the GC queue, so `queue_saturations > 0` failed on fast builds or passed only by chance. | Result depending on build speed (sanitizer vs optimized trees) | `tests/stress/test_stress.cpp` sets `max_pending_tasks = 64` (the minimum accepted range is 16), so saturation happens on purpose at any build speed. The test asserts `queue_saturations > 0`. |
 | A leak in the daemon was invisible: mount tests only checked the mount, not how the daemon ended. | LeakSanitizer now on by default in Debug | `MountTest::TearDown()` requires exit status 0, no memory error/race/UB report and no leak allocated by TSFS code in the daemon output (`classify_leaks()`). |
 | File and directory handles still open when the daemon stopped (a RELEASE still queued at SIGTERM, or files held open by applications) were never freed: libfuse does not call release() for them. Found intermittently by LeakSanitizer in `MountTest.RenameNoReplaceAndExchange`. | ASan/LSan, debug tree under parallel load | `PassthroughFs` tracks its live handles (`adopt()`/`take_file()`/`take_dir()`) and frees the remaining ones in its destructor, logged as `filesystem_handles_released`; the daemon destroys the filesystem before shutting the logger down. Regression test `MountTest.ShutdownWithOpenFilesFreesTheirHandles` (verified to fail without the fix). |
+| A `SIGTERM` (or `SIGHUP`) received during startup, before the signal handlers were installed, killed the daemon with the default action; after the mount, this left a dead mount (`ENOTCONN`). | ThreadSanitizer runs on 2 CPUs (simulating CI), where the startup is slow enough for the test harness's `SIGTERM` to arrive early | `Daemon::run()` blocks the asynchronous signals as its very first step; a pending signal is handled once the loop runs (clean unmount, exit 0). Regression test `MountTest.SigtermDuringStartupUnmountsCleanly` (verified to fail without the fix). |
 | Teardown order of `Logger::Pipeline`: sinks could be destroyed while the async thread pool was still draining into them. | TSan | `src/logging/logger.cpp`: `~Pipeline()` resets `pool` first. That joins the worker after it drains its queue, and only then are the sinks released. Under TSan this path is exercised by `LoggingTest.ShutdownFlushesQueuedMessages`, `ReconfigureToNewDirectoryAndFilename`, `ConcurrentWritersWithRotationLoseNothingWithBlockPolicy` and the stress test, which logs while the configuration is reloaded. |
 
 ## 10. Coverage
@@ -273,7 +281,7 @@ See [coverage](../developer/coverage.md) for interpreting the report.
    ```
 
    `tsfs_add_test()` links `tsfs_test_support` (`tsfs_core` + GoogleTest), defines
-   `TSFS_BINARY` and `TSFS_CRASH_HELPER`, discovers the cases, applies the labels, the
+   `TSFS_BINARY`, `TSFS_CRASH_HELPER`, `TSFS_LS_BINARY` and `TSFS_SOURCE_DIR`, discovers the cases, applies the labels, the
    timeout (default 120 s) and the skip expression, and exports `TSFS_TEST_ARTIFACT_DIR`.
    It also exports the sanitizer options of section 8. Add
    `add_dependencies(<name> tsfs)` when the test starts the daemon.

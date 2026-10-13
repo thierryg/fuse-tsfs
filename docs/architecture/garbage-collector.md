@@ -57,7 +57,7 @@ All from `garbage_collector` (`GcConfig`, `src/config/config.hpp`; ranges from
 
 | Key | Default | Range | Role |
 |---|---|---|---|
-| `enabled` | `true` | | When false the coordinator sleeps until the next configuration change. |
+| `enabled` | `true` | | When false the coordinator sleeps until the next configuration change or a purge request; the workers keep running (a purge uses them). |
 | `dry_run` | `false` | | Validate everything, delete nothing (section 10). |
 | `scan_interval` | `1m` | >= 1s | Time between the starts of two reconciliation passes; horizon = 2 x this. |
 | `max_scan_duration` | `5s` | >= 10ms | Length of one scan slice. |
@@ -293,6 +293,9 @@ parentheses when it differs).
 | `scans_completed`, `last_scan_files` (`managed_files`), `last_scan_duration_ms`, `last_scan_completed_unix_ms` (`last_reconciliation_unix_ms`) | Reconciliation |
 | `scan_time_ms`, `delete_time_us`, `worker_busy_us` | Cumulative time scanning, validating+deleting, and in worker batches |
 | `scheduled`, `pending_work`, `workers`, `config_generation` | Gauges (scheduler size, work queue + in flight, threads, snapshot generation) |
+| `purges_completed` | Purges finished (section 15) |
+| `purging` | Gauge: 1 while a purge runs |
+| `last_purge_deleted`, `last_purge_bytes`, `last_purge_failed`, `last_purge_skipped_open` (`last_purge.deleted`, `.bytes_deleted`, `.failed`, `.skipped_open`) | Result of the last completed purge |
 
 ## 12. Metrics status file
 
@@ -306,7 +309,9 @@ created by `mkostemp("<file>.tmp.XXXXXX")` (unpredictable name, `O_EXCL`), set t
 mode 0640 with `fchmod`, then renamed over the target, so readers never see a
 partial document. It is written by the housekeeping thread every
 `metrics.interval` (default 10s), on SIGUSR1 by the watcher thread, and once at
-shutdown, only when `metrics.enabled`; `Daemon::status_mutex_` serializes the
+shutdown, only when `metrics.enabled`. The housekeeping thread, which wakes up
+every second, also writes it as soon as `purges_completed * 2 + purging` changes,
+that is when a purge starts and when it ends (section 15); `Daemon::status_mutex_` serializes the
 writers. `tsfs --status` prints the
 file. No IPC endpoint is opened. Schema: [monitoring](../user/monitoring.md).
 
@@ -330,3 +335,75 @@ is processing; a worker waiting in `TokenBucket::acquire` returns at once. The
 remaining work queue is cleared and, with the scheduler size, reported as
 `pending_abandoned` in `gc_completed`; it is rediscovered by the first pass of
 the next start (`ShutdownWithPendingTasksIsFast`).
+
+## 15. Purge (`tsfs --purge`, SIGUSR2)
+
+`request_purge()` sets `purge_requested_` and `wake_` under `mutex_` and wakes the
+coordinator; it never blocks. The daemon calls it from the configuration watcher
+thread when `SIGUSR2` arrives (eventfd bridge, see
+[configuration reload](configuration-reload.md)), after logging
+`gc_purge_requested`. The coordinator checks the flag at the top of each
+iteration, before the `enabled` test, so a purge also runs with
+`garbage_collector.enabled: false` (the workers are started by `start()`
+whatever `enabled` says).
+
+`run_purge(snapshot, stop)`, in the coordinator thread:
+
+1. sets `purging_` (atomic): while it is set, the workers skip
+   `TokenBucket::acquire`, so `max_deletions_per_second` does not apply; logs
+   `gc_purge_started` (`dry_run`);
+2. runs a complete reconciliation pass from the root (scanner reset), slice after
+   slice, draining notifications and calling `dispatch_due(snap, unlimited=true)`
+   after each slice: the per-cycle budget (`max_deletions_per_cycle`) is ignored,
+   the work-queue capacity still applies (backpressure);
+3. drains: dispatches until nothing is due now, the work queue is empty and no
+   candidate is in flight (waking every 10 ms or when a worker signals);
+4. repeats from step 2 while the pass increased `queue_saturations`: expired files
+   that did not fit in the bounded scheduler (`max_pending_tasks`) are found by the
+   next pass once the previous ones are deleted. At most 1000 passes
+   (`kMaxPasses`), and stop requests are honored between slices;
+5. sets `next_scan_` to now + `scan_interval`, stores the differences of
+   `deleted`, `bytes_deleted`, `failed` and `skipped_open` since step 1 as the
+   `last_purge_*` values, then increments `purges_completed` (release
+   increment after the relaxed `last_purge_*` stores; `stats()` reads every
+   counter with relaxed loads, so the pairing relies on the stores happening
+   first and on the status file being written after both), clears `purging_`, and logs `gc_purge_completed` (`deleted`,
+   `would_delete`, `failed`, `skipped_open`, `passes`).
+
+Each candidate goes through the regular validation of section 6 under the path
+locks (identity, type, device, open handle, current policy, expiry): a purge only
+removes waiting time; it never deletes a file the regular collector would keep.
+Excluded and `never` files are never scheduled. With `dry_run: true` the
+validations end in `would_delete`, as usual. Files expiring later but within the
+horizon are scheduled by the pass and handled later by the regular collector.
+The `last_purge_*` values are differences of global counters, so deletions made
+by the regular pipeline during the purge (for example the end of a batch already
+in the work queue) are included.
+
+**Command-line side** (`action_purge`, `src/app/application.cpp`):
+
+* `--purge --dry-run` is `action_dry_run` (section 10).
+* `garbage_collector.dry_run: true` is refused (exit 7) before anything else.
+* The daemon is looked up in `metrics.status_file` (when `metrics.enabled`): its
+  `pid` must be alive (`kill(pid, 0)`, `EPERM` counts as alive), `/proc/<pid>/comm`
+  must be `tsfs`, and its `mountpoint` must equal the configured one. Otherwise the
+  status file is considered stale.
+* No daemon but `fuse_connection_id(mountpoint)` finds a FUSE mount there: refused
+  (exit 7), since an offline purge cannot see the files open through the mount.
+* Without `--force`, a terminal is required on standard input (exit 2 otherwise)
+  and the user must answer `y` or `yes`.
+* With a daemon: `kill(pid, SIGUSR2)` (`EPERM`: exit 3), then the status file is
+  polled every 250 ms until `purges_completed` exceeds the value read before the
+  signal; progress (`deleted` difference) is printed every 5 s; the result comes
+  from `last_purge`; exit 1 when `last_purge.failed > 0` or when the daemon
+  disappears.
+* Without a daemon (mount point not mounted): a standalone `GarbageCollector`
+  (no threads, no open-file registry) with `max_deletions_per_second` and
+  `max_deletions_per_cycle` forced to 0 runs `run_full_scan()` +
+  `process_due_now()` until a pass adds no queue saturation (at most 1000
+  passes), and prints `purge: N file(s) deleted (SIZE), F failed`.
+
+Tests: `GcTest.PurgeDeletesEveryExpiredFileAtOnce`,
+`GcTest.PurgeWorksWithTheGcDisabledAndHonorsDryRun`,
+`MountTest.PurgeCommandDeletesExpiredFilesThroughTheDaemon`,
+`CommandLine.PurgeStatsAndPreview`.

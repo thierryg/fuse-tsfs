@@ -30,6 +30,7 @@ namespace {
 
 std::atomic<int> g_reload_fd{-1};
 std::atomic<int> g_status_fd{-1};
+std::atomic<int> g_purge_fd{-1};
 
 void notify_fd(int fd) noexcept {
     if (fd >= 0) {
@@ -51,6 +52,12 @@ void on_sigusr1(int) {
     errno = saved;
 }
 
+void on_sigusr2(int) {
+    const int saved = errno;
+    notify_fd(g_purge_fd.load(std::memory_order_relaxed));
+    errno = saved;
+}
+
 void drain_eventfd(int fd) noexcept {
     std::uint64_t value = 0;
     [[maybe_unused]] const ssize_t n = ::read(fd, &value, sizeof(value));
@@ -63,9 +70,10 @@ constexpr std::uint32_t kWatchMask =
 
 }  // namespace
 
-void install_control_signal_handlers(int reload_fd, int status_fd) noexcept {
+void install_control_signal_handlers(int reload_fd, int status_fd, int purge_fd) noexcept {
     g_reload_fd.store(reload_fd);
     g_status_fd.store(status_fd);
+    g_purge_fd.store(purge_fd);
     struct sigaction action{};
     sigemptyset(&action.sa_mask);
     action.sa_flags = SA_RESTART;
@@ -73,6 +81,8 @@ void install_control_signal_handlers(int reload_fd, int status_fd) noexcept {
     ::sigaction(SIGHUP, &action, nullptr);
     action.sa_handler = status_fd >= 0 ? on_sigusr1 : SIG_DFL;
     ::sigaction(SIGUSR1, &action, nullptr);
+    action.sa_handler = purge_fd >= 0 ? on_sigusr2 : SIG_DFL;
+    ::sigaction(SIGUSR2, &action, nullptr);
 }
 
 Result<std::unique_ptr<ConfigWatcher>> ConfigWatcher::create(std::string config_path, Callbacks callbacks) {
@@ -83,8 +93,9 @@ Result<std::unique_ptr<ConfigWatcher>> ConfigWatcher::create(std::string config_
     watcher->callbacks_ = std::move(callbacks);
     watcher->reload_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     watcher->status_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    watcher->purge_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
     watcher->stop_fd_.reset(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
-    if (!watcher->reload_fd_ || !watcher->status_fd_ || !watcher->stop_fd_) {
+    if (!watcher->reload_fd_ || !watcher->status_fd_ || !watcher->purge_fd_ || !watcher->stop_fd_) {
         const int err = errno;
         return make_error(err, std::string("eventfd: ") + std::strerror(err));
     }
@@ -138,11 +149,12 @@ void ConfigWatcher::run(std::stop_token stop) {
     Clock::time_point next_rewatch = Clock::now() + kRewatchInterval;
     std::array<char, 16 * 1024> buffer{};
     while (!stop.stop_requested()) {
-        std::array<pollfd, 4> fds{{{stop_fd_.get(), POLLIN, 0},
+        std::array<pollfd, 5> fds{{{stop_fd_.get(), POLLIN, 0},
                                    {reload_fd_.get(), POLLIN, 0},
                                    {status_fd_.get(), POLLIN, 0},
+                                   {purge_fd_.get(), POLLIN, 0},
                                    {inotify_.get(), POLLIN, 0}}};
-        const nfds_t count = inotify_ ? 4 : 3;
+        const nfds_t count = inotify_ ? 5 : 4;
         auto now = Clock::now();
         Clock::time_point wake =
             watch_.load(std::memory_order_relaxed) < 0 ? next_rewatch : now + std::chrono::hours(1);
@@ -169,7 +181,13 @@ void ConfigWatcher::run(std::stop_token stop) {
                 callbacks_.dump_status();
             }
         }
-        if (count == 4 && (fds[3].revents & POLLIN) != 0) {
+        if ((fds[3].revents & POLLIN) != 0) {
+            drain_eventfd(purge_fd_.get());
+            if (callbacks_.purge) {
+                callbacks_.purge();
+            }
+        }
+        if (count == 5 && (fds[4].revents & POLLIN) != 0) {
             for (;;) {
                 const ssize_t n = ::read(inotify_.get(), buffer.data(), buffer.size());
                 if (n <= 0) {

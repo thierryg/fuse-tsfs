@@ -41,6 +41,8 @@ Related documents: [architecture overview](../architecture/overview.md),
 | Integrity of file ownership and permissions in the backing tree | The daemon usually runs as root and creates entries on behalf of users. |
 | The configuration file | It defines the deletion policy and the paths the daemon writes to (logs, crash reports, status file). |
 | Logs, crash reports, status file | Logs and reports contain managed paths and file names. Crash reports also contain memory maps and register dumps. |
+| The retention policy itself | Rule identifiers and expiries reveal what is kept and for how long. Part of it is visible to mount users through the retention extended attributes (6.3). |
+| The system `ls` | Renamed `/usr/bin/ls.orig` and wrapped by `tsfs-ls` (installed as `/usr/bin/ls`) at a default root installation; every user and many scripts run it (6.8). |
 | Availability of the mount and of the host | Includes memory, file descriptors, disk space used by logs, and CPU. |
 
 ## 2. Trust boundaries
@@ -108,8 +110,11 @@ network attackers. TSFS opens no network socket. The systemd unit restricts it t
    triggers.
 4. **Output files** (logs, rotated or compressed logs, crash reports, status file) and
    their directories.
-5. **Signals** (`SIGHUP` reload, `SIGUSR1` status, `SIGTERM`/`SIGINT` shutdown). Only the
-   process owner or root can send them.
+5. **Signals** (`SIGHUP` reload, `SIGUSR1` status, `SIGUSR2` purge, `SIGTERM`/`SIGINT`
+   shutdown). Only the process owner or root can send them.
+7. **`tsfs-ls`** (`src/tools/tsfs_ls.cpp`), installed as `/usr/bin/ls` by default: its
+   command line, environment (`TSFS_LS`, `TSFS_REAL_LS`, `PATH`), the output of the
+   original `ls` it parses, and the extended attributes it reads.
 6. **Crash diagnostics**: optional native core dumps (`diagnostics.native_core_dump`).
 
 ## 5. Security properties claimed
@@ -258,6 +263,24 @@ through another link is not counted in `bytes_deleted`.
   `garbage_collector.enabled: false` or `dry_run: true` to stop deletions.
 * Exceptions never unwind into libfuse. The trampoline converts `std::bad_alloc` to
   ENOMEM and any other exception to EIO.
+* **Retention extended attributes** (`getxattr`, `filesystem.retention_xattrs`, default
+  `true`). Read-only: `setxattr` and `removexattr` are not implemented, and the real
+  extended attributes of the backing files (ACLs, security labels, `user.*`) are never
+  exposed through the mount. A name outside `user.tsfs.state`, `user.tsfs.expires`,
+  `user.tsfs.rule` and `user.tsfs.created` returns ENODATA without touching the disk;
+  the four names resolve
+  the path with the same `BackingStore` rules as every other operation (no symlink
+  following, device check) and only answer for regular files. **Information
+  disclosure:** with `default_permissions`, the kernel applies its usual check to a
+  `user.*` attribute (`xattr_permission()`: search permission on the path and read
+  permission on the file), so in practice any user who can reach and read a file
+  through the mount, which for a mode 0644 file means every user of the mount, can read
+  its expiry, its state, the identifier of the deciding rule and its creation time
+  (`user.tsfs.created`: birth time of the backing file, else its modification time).
+  This reveals part of
+  the policy (for example that `/hr/` files are deleted
+  after 30 days, or the name of an exclusion rule). Name rules neutrally, or set
+  `retention_xattrs: false` when this matters. `listxattr` returns an empty list.
 
 ### 6.4 Configuration (`src/config/`)
 
@@ -354,6 +377,54 @@ Not bounded: the list of directories that the scanner still has to visit
 (`TreeScanner::pending_`) grows with the number of directories in the backing tree (see
 R8).
 
+### 6.8 The `tsfs-ls` replacement of the system `ls`
+
+By default (`TSFS_REPLACE_SYSTEM_LS=ON`), `cmake --install` run as root without
+`DESTDIR` renames the system `/usr/bin/ls` to `/usr/bin/ls.orig` (`rename(2)`, no copy:
+a regular file such as GNU `ls`, or a symbolic link such as the uutils coreutils
+multi-call binary of Ubuntu 26.04, is kept exactly as it is) and installs `tsfs-ls` as
+`/usr/bin/ls`; the `uninstall` target renames `ls.orig` back. The project chose this
+replacement deliberately, over safer alternatives (a separate command, a shell alias);
+its consequences:
+
+* **Package integrity.** `/usr/bin/ls` belongs to `coreutils`: `dpkg --verify coreutils`
+  and checks based on `dpkg -S` report it while the wrapper is in place (the file dpkg
+  installed now lives under another name), and file-integrity monitors (AIDE,
+  Tripwire, IMA) flag it. A coreutils upgrade or reinstallation puts the system `ls`
+  back over the wrapper; the next TSFS installation renames it to `ls.orig` again,
+  replacing the stale one.
+* **Blast radius.** Every user, every login shell and many scripts run `ls`. A crash or
+  a wrong listing in the wrapper would affect all of them. Mitigations: the original
+  `ls` runs with the identical command line (`execv`) whenever standard output is not a
+  terminal (all pipes and redirections, hence nearly all scripts, get exactly the
+  system `ls` output), no operand is inside a `fuse.tsfs` mount, `TSFS_LS=off`, or the
+  options include `--help`, `--version`, `--zero`, `--dired` or `-D`. Even inside a TSFS
+  mount, the listing itself is produced by the original `ls` (run with `-l --dired` after the user's options
+  prepended); the wrapper only splits its output with the dired byte offsets and
+  appends the tags. Output without a dired trailer is printed unchanged.
+* **Which `ls` runs.** The original is `$TSFS_REAL_LS`, then `/usr/bin/ls.orig`, then
+  the first `ls` of `PATH` that is not the wrapper (marker `TSFS-LS-WRAPPER-v2`), always
+  with `argv[0]` = `ls`. `TSFS_REAL_LS` and `PATH` come from the caller's own
+  environment, so they only let a user run a program of their choice with their own
+  rights, which they can do anyway. `tsfs-ls` is not setuid and gains no privilege.
+  Running `/usr/bin/ls.orig` directly works for GNU `ls` and for uutils (the multi-call
+  binary is reached through a link named `ls`).
+* **What it reads.** `/proc/self/mountinfo`, the captured output of the original `ls`,
+  and `lgetxattr()` of the `user.tsfs.state`, `rule`, `expires` and `created`
+  attributes of each listed entry (no symlink following). Control characters in the
+  printed lines become `?`, so a crafted file name cannot send escape sequences to the
+  terminal; colors are not shown in TSFS listings.
+* **Installation safety.** Only as root and never with `DESTDIR`. The wrapper is copied
+  to `/usr/bin/ls.tsfs-new` (mode 0755) then renamed over `/usr/bin/ls`, so `/usr/bin/ls`
+  is never partial; it is absent only briefly during a first installation, between
+  the rename of the system `ls` and the rename of the wrapper. If `/usr/bin/ls` is
+  already the wrapper but `ls.orig` is missing, the installation fails
+  (`FATAL_ERROR`, asking for `apt install --reinstall coreutils`) rather than leave no
+  original. Verified as root in a disposable container with uutils coreutils 0.8.0:
+  install, reinstall, uninstall restoring the identical symbolic link (same target).
+* **Opting out.** `-DTSFS_REPLACE_SYSTEM_LS=OFF` at build time (`tsfs-ls` stays
+  available under its own name), `TSFS_LS=off` per shell.
+
 ## 7. Mount namespaces, mount boundaries and bind mounts
 
 ### 7.1 Which namespace
@@ -403,8 +474,22 @@ directory.
   data **only through the mount**, where the path locks, the open-file registry and the
   notifications apply. Keep this property when you choose another backing directory.
 * No IPC endpoint exposes administrative commands. `tsfs --status` reads the status
-  file. Reload and status requests are signals, which only the process owner and root
-  can send.
+  file. Reload, status and purge requests are signals, which only the process owner and
+  root can send.
+* **Purge** (`tsfs --purge`, `SIGUSR2`). Only users allowed to signal the daemon (root, or
+  its own uid) can request a purge; `tsfs --purge` exits with code 3 when `kill()` fails
+  with EPERM. A purge does not widen what may be deleted: it ignores
+  `max_deletions_per_second` and `max_deletions_per_cycle`, but every candidate goes
+  through the full validation of 6.2 (P4, P5), excluded and `never` files are never
+  candidates, and `garbage_collector.dry_run: true` still prevents every deletion. What
+  it removes is the blast-radius limit of the rate settings (see R3): after a bad rule
+  or a clock step, a purge deletes everything that looks expired at once. The command
+  finds the daemon through the status file (`pid` alive, `/proc/<pid>/comm` equal to
+  `tsfs`, same mount point), so a forged or stale status file can at most make it signal
+  another process named `tsfs` that the caller may signal anyway. When the mount point
+  is mounted but no daemon is found, the offline purge is refused, because the CLI
+  process cannot see the files open through the mount. An offline purge (no mount) runs
+  with the caller's rights over the backing directory.
 
 ## 9. systemd unit hardening and its deliberate limits
 
@@ -412,7 +497,7 @@ directory.
 
 * `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE`
   (no `CAP_MKNOD`: device nodes are refused anyway; no `CAP_SETFCAP`: extended
-  attributes are not supported)
+  attributes cannot be set through the mount)
 * `NoNewPrivileges=yes`, `LockPersonality=yes`, `RestrictRealtime=yes`,
   `RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_UNIX`,
   `SystemCallArchitectures=native`
@@ -446,6 +531,9 @@ so a file created with mode `0644` by a client is stored as `0644` (regression t
 | R8 | **Memory growth on huge trees.** The scanner's pending-directory list is not bounded by configuration. A user who creates millions of directories increases the daemon's memory use during a pass. | Accepted, bounded by the tree size. |
 | R9 | **Policy is path-based.** A user who may rename a file can move it under a rule with a shorter retention. The kernel's permission and sticky-bit checks decide who may do that. TSFS adds no restriction of its own. | By design. |
 | R10 | **No exclusion of in-progress writes by direct writers or through `mmap` alone.** `skip_open_files` covers handles opened through the mount (an `mmap` keeps the handle open). | Accepted. |
+| R11 | **Policy disclosure through the retention attributes.** Any user who can reach and read a file through the mount can read its expiry, rule identifier and creation time (6.3). | Accepted by default; `filesystem.retention_xattrs: false` removes it. |
+| R12 | **System `ls` wrapped by `tsfs-ls`** (6.8): a package-owned file is renamed (`/usr/bin/ls.orig`), and a defect of the wrapper affects every user. | Accepted by the default installation (explicit choice); mitigated by running the original `ls` unchanged outside TSFS mounts and in pipes, and by letting it produce every listing; `-DTSFS_REPLACE_SYSTEM_LS=OFF` avoids it. |
+| R13 | **Purge removes the rate limits** that bound the damage of a bad rule or a clock step. | Restricted to users who can signal the daemon; preview with `tsfs --purge --dry-run`; confirmation on a terminal. |
 
 ## 11. Security testing procedures
 
@@ -455,8 +543,8 @@ the C++26 toolchain, `/dev/fuse` and `CAP_SYS_ADMIN`.
 | Test file | What it attacks |
 |---|---|
 | `tests/security/test_backing_store.cpp` (`tsfs_security_tests`, 14 tests) | Each case runs with openat2 and with the forced fallback walk: absolute, relative and nested directory symlinks, the `/proc/self/root` magic link, a final symlink seen as a link, non-normalized paths (`..`, `.`, `//`, trailing `/`, relative, empty), and a directory swapped for a symlink after a successful resolution. |
-| `tests/gc/test_garbage_collector.cpp` (`tsfs_gc_tests`, 28 tests) | `SymlinksAreNeverFollowedNorDeleted`, `DirectorySwappedForSymlinkIsRefused`, `ReplacedFileIsNeverDeletedOnTheStaleRecord`, `RenamedFileIsNotFollowedToItsNewName`, `FileModifiedAfterSchedulingIsNotDeleted`, `OpenFileIsSkippedAndRetriedLater`, `ExclusionAddedByReloadPreventsDeletion`, `ClockStepBackwardsDoesNotDeleteEarly`, `HardLinkedFileOnlyLosesTheExpiredName`, `PermissionFailureIsRetriedThenGivenUp`, `ConcurrentCreationNeverLosesFreshFiles`, rate and budget limits. |
-| `tests/filesystem/test_mount.cpp` (`tsfs_filesystem_tests`, 21 tests) | The real daemon on a real FUSE mount: `DeviceNodesAreRefused`, `PermissionsOwnershipAndTimestamps`, `SymlinksAndHardLinks`, `OpenFileIsNotDeletedUntilReleased`, `FileBindMountedFromAnotherFilesystemIsNotReachable` (EXDEV on the final component; root only), `NewEntryModeIgnoresTheDaemonUmask`, `ReadOnlyMountTest.WritesAreRefused`, invalid reload, and clean shutdown. Every test also requires the daemon to exit with status 0 without a sanitizer report. Skipped when FUSE is unavailable. |
+| `tests/gc/test_garbage_collector.cpp` (`tsfs_gc_tests`, 30 tests) | `SymlinksAreNeverFollowedNorDeleted`, `DirectorySwappedForSymlinkIsRefused`, `ReplacedFileIsNeverDeletedOnTheStaleRecord`, `RenamedFileIsNotFollowedToItsNewName`, `FileModifiedAfterSchedulingIsNotDeleted`, `OpenFileIsSkippedAndRetriedLater`, `ExclusionAddedByReloadPreventsDeletion`, `ClockStepBackwardsDoesNotDeleteEarly`, `HardLinkedFileOnlyLosesTheExpiredName`, `PermissionFailureIsRetriedThenGivenUp`, `ConcurrentCreationNeverLosesFreshFiles`, rate and budget limits, `PurgeDeletesEveryExpiredFileAtOnce` (exclusions and young files kept), `PurgeWorksWithTheGcDisabledAndHonorsDryRun`. |
+| `tests/filesystem/test_mount.cpp` (`tsfs_filesystem_tests`, 26 tests) | The real daemon on a real FUSE mount: `DeviceNodesAreRefused`, `PermissionsOwnershipAndTimestamps`, `SymlinksAndHardLinks`, `OpenFileIsNotDeletedUntilReleased`, `FileBindMountedFromAnotherFilesystemIsNotReachable` (EXDEV on the final component; root only), `NewEntryModeIgnoresTheDaemonUmask`, `RetentionExtendedAttributes` (read-only, unknown names give ENODATA, empty list), `PurgeCommandDeletesExpiredFilesThroughTheDaemon` (excluded file kept), `TsfsLsShowsRetentionOnATerminalAndDelegatesOtherwise` (piped output identical to the system `ls`), `SigtermDuringStartupUnmountsCleanly` (no dead mount), `ReadOnlyMountTest.WritesAreRefused`, invalid reload, and clean shutdown. Every test also requires the daemon to exit with status 0 without a sanitizer report. Skipped when FUSE is unavailable. |
 | `tests/config/test_config.cpp` | `ConfigTrust.RootRequiresARootOwnedFileNotWritableByOthers`, `ConfigTrust.UnprivilegedDaemonOnlyNeedsARegularFile`, `ConfigOverrides.CommandLinePathsAreValidatedLikeTheFile`. |
 | `tests/stress/test_stress.cpp` | Invariant under churn and reloads: a file younger than its retention is never deleted. |
 | `tests/unit/test_common.cpp` | `ManagedPath.*` (normalization, traversal, NUL, component-wise `is_within`) and `Escape.*` (log injection). |
@@ -465,7 +553,7 @@ Commands:
 
 ```sh
 # Build the Debug tree (ASan + LeakSanitizer + UBSan by default), then run the
-# security label (63 tests: tsfs_security_tests, tsfs_gc_tests, tsfs_filesystem_tests).
+# security label (70 tests: tsfs_security_tests, tsfs_gc_tests, tsfs_filesystem_tests).
 scripts/tsfs-dev.sh cmake --preset debug
 scripts/tsfs-dev.sh cmake --build --preset debug
 scripts/tsfs-dev.sh ctest --test-dir build/debug -L security --output-on-failure
@@ -479,7 +567,9 @@ scripts/tsfs-dev.sh cmake --build --preset tsan
 scripts/tsfs-dev.sh --no-aslr ctest --preset tsan
 ```
 
-On 2026-10-13, 194 of the 196 tests passed in the `debug` tree (ASan + LeakSanitizer +
+The suite has 206 tests. In the last recorded full run (2026-10-13, before the purge,
+`tsfs-ls`, retention-attribute and startup-signal tests were added), 197 of the 199
+tests passed in the `debug` tree (ASan + LeakSanitizer +
 UBSan); 2 were skipped: `DiagnosticsTest.NativeCoreDumpWhenTheEnvironmentAllowsIt`
 (unless `TSFS_TEST_ENABLE_CORE_DUMPS=1` is set) and the root-only
 `MountTest.FileBindMountedFromAnotherFilesystemIsNotReachable`, run separately as root. The whole gate, TSan
@@ -514,3 +604,6 @@ and R4 races; ownership handover as root (validated manually in the container;
 - [ ] Enable `allow_other` only when other users need the mount.
 - [ ] Leave `diagnostics.native_core_dump` off unless you are debugging.
 - [ ] Do not create bind mounts or other mounts below the backing directory.
+- [ ] Decide whether mount users may see expiries, rule identifiers and creation times; otherwise set `filesystem.retention_xattrs: false`.
+- [ ] Decide whether the system `ls` may be replaced; otherwise build with `-DTSFS_REPLACE_SYSTEM_LS=OFF`.
+- [ ] Restrict who can signal the daemon (`SIGUSR2` purges); preview purges with `tsfs --purge --dry-run`.

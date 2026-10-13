@@ -51,6 +51,8 @@ The daemon writes the file:
 
 - every `metrics.interval` (default 10 s);
 - immediately on `SIGUSR1`;
+- within a second when a purge (`tsfs --purge` or `SIGUSR2`) starts and when it
+  ends, so that `tsfs --purge` can wait for its result;
 - once more during a clean shutdown, with the final counters.
 
 Writes are atomic: the content goes to a temporary file
@@ -125,8 +127,9 @@ Example, taken from a daemon that has just deleted one expired file:
   "mountpoint": "/srv/tsfs",
   "backing_directory": "/var/lib/tsfs/data",
   "config": {"generation": 1, "reloads": 0, "reload_failures": 0},
-  "gc": {"candidates": 1, "deleted": 1, "bytes_deleted": 4, "would_delete": 0, "vanished": 0, "skipped_modified": 0, "skipped_replaced": 0, "skipped_open": 0, "skipped_unsafe": 0, "failed": 0, "retries": 0, "queue_saturations": 0, "events_dropped": 0, "scans_completed": 2, "managed_files": 2, "last_scan_duration_ms": 0, "last_reconciliation_unix_ms": 1791880244290, "scan_time_ms": 0, "delete_time_us": 62, "worker_busy_us": 86, "scheduled": 0, "pending_work": 0, "workers": 2},
+  "gc": {"candidates": 1, "deleted": 1, "bytes_deleted": 4, "would_delete": 0, "vanished": 0, "skipped_modified": 0, "skipped_replaced": 0, "skipped_open": 0, "skipped_unsafe": 0, "failed": 0, "retries": 0, "queue_saturations": 0, "events_dropped": 0, "scans_completed": 2, "managed_files": 2, "last_scan_duration_ms": 0, "last_reconciliation_unix_ms": 1791880244290, "scan_time_ms": 0, "delete_time_us": 62, "worker_busy_us": 86, "scheduled": 0, "pending_work": 0, "workers": 2, "purges_completed": 0, "purging": 0, "last_purge": {"deleted": 0, "bytes_deleted": 0, "failed": 0, "skipped_open": 0}},
   "filesystem": {"operations": {"getattr": {"calls": 24, "errors": 6}, "readlink": {"calls": 0, "errors": 0}, "...": {}}, "bytes_read": 0, "bytes_written": 10, "open_handles": 0},
+  "fuse": {"connection_id": 70, "control_dir": "/sys/fs/fuse/connections/70", "waiting": 0},
   "logging": {"queue_overruns": 0, "lost_writes": 0, "rotations": 0, "reconfigurations": 1, "notices_dropped": 0}
 }
 ```
@@ -180,6 +183,19 @@ them.)
 | `scheduled`                   | gauge   | entries currently in the expiration scheduler |
 | `pending_work`                | gauge   | entries handed to the workers and not yet processed |
 | `workers`                     | gauge   | running worker threads |
+| `purges_completed`            | counter | purges finished (`tsfs --purge` or `SIGUSR2`) |
+| `purging`                     | gauge   | 1 while a purge runs, 0 otherwise |
+| `last_purge.deleted`          | gauge   | files deleted by the last completed purge |
+| `last_purge.bytes_deleted`    | gauge   | bytes freed by the last completed purge |
+| `last_purge.failed`           | gauge   | deletions that failed during the last completed purge |
+| `last_purge.skipped_open`     | gauge   | expired files kept by the last completed purge because they were open through the mount |
+
+The `last_purge` values are differences of the global counters (`deleted`,
+`bytes_deleted`, `failed`, `skipped_open`) between the start and the end of the
+purge: deletions made by the regular collector during the same interval are
+included. They are stored before `purges_completed` is incremented: read them in
+the first status document whose `purges_completed` has increased (this is what
+`tsfs --purge` does).
 
 ### `filesystem`
 
@@ -194,12 +210,46 @@ them.)
 `<op>` is one of: `getattr`, `readlink`, `mknod`, `mkdir`, `unlink`, `rmdir`,
 `symlink`, `rename`, `link`, `chmod`, `chown`, `truncate`, `open`, `read`, `write`,
 `statfs`, `flush`, `release`, `fsync`, `opendir`, `readdir`, `releasedir`,
-`fsyncdir`, `access`, `create`, `utimens`, `fallocate`, `lseek`.
+`fsyncdir`, `access`, `create`, `utimens`, `fallocate`, `lseek`, `getxattr`,
+`listxattr`.
 
 Errors include ordinary results such as `ENOENT` on `getattr` (a shell or an
 editor probing for a file that does not exist), so a non-zero error count is normal.
 Watch the trend, and the `filesystem_operation_failed` warnings for unexpected
 errors.
+
+`getxattr` is high on a mount that receives writes: the kernel looks up
+`security.capability` before each write request, and TSFS answers `ENODATA` (no
+disk access), so these lookups appear as `getxattr` errors, one per write. This is
+normal. With `filesystem.retention_xattrs: false`, the `getxattr` and `listxattr`
+callbacks are not registered and both counters stay at 0 (see
+[configuration.md](configuration.md)).
+
+### `fuse`
+
+The kernel side of the mount. The FUSE kernel module exposes one directory per
+connection (per mounted FUSE filesystem) in the `fusectl` filesystem, mounted on
+`/sys/fs/fuse/connections` by systemd (`sys-fs-fuse-connections.mount`).
+
+| Field           | Type   | Meaning |
+|-----------------|--------|---------|
+| `connection_id` | number | identifier of the connection: the device number of the mount (`stat -c %d MOUNTPOINT`), read once after mounting from `/proc/self/mountinfo`; `null` if it could not be determined |
+| `control_dir`   | string | `/sys/fs/fuse/connections/<connection_id>`, or `null` |
+| `waiting`       | gauge  | requests sent by the kernel and not answered yet by the daemon, read from `<control_dir>/waiting` at each status update; `null` when `fusectl` is not mounted (common in containers) or not readable |
+
+`waiting` near 0 is normal; a value that stays high (tens of requests) while
+applications block on the mount means the daemon is slow or stuck. The other files
+of the directory, owned by the user who mounted (root for the service):
+
+```sh
+D=/sys/fs/fuse/connections/$(stat -c %d /mnt/recordings)
+cat $D/waiting $D/max_background $D/congestion_threshold
+echo 1 | sudo tee $D/abort    # last resort: fail every pending and future request
+```
+
+Writing to `abort` immediately fails the requests of blocked processes (`ENOTCONN`)
+and disconnects the mount for good: unmount it (`umount -l`) and restart the
+service. Use it only when the daemon is hung and cannot be stopped normally.
 
 ### `logging`
 
@@ -217,8 +267,8 @@ errors.
   persisted: a restart resets them. Compute rates from the difference between two
   readings, and treat a decrease (or a new `pid`) as a restart.
 - **Gauges** are instantaneous values: `managed_files`, `last_scan_duration_ms`,
-  `last_reconciliation_unix_ms`, `scheduled`, `pending_work`, `workers`,
-  `open_handles`, and `config.generation`.
+  `last_reconciliation_unix_ms`, `scheduled`, `pending_work`, `workers`, `purging`,
+  the `last_purge` values, `open_handles`, `fuse.waiting`, and `config.generation`.
 
 ## 5. Log events
 
@@ -235,7 +285,7 @@ the event is unquoted, so `grep 'event=gc_file_deleted'` works; in JSON use
 | `config_reload_failed` | config | error | reload rejected (`error`), previous configuration still active |
 | `config_restart_required` | config | warning | a restart-only setting changed (`setting`); the running value is kept |
 | `filesystem_mount_started` | fs | info | mounting (written to stderr, before the log file is configured) |
-| `filesystem_mounted` | fs | info | mount ready; also logged by the FUSE `init` callback (`openat2`, `read_only`) |
+| `filesystem_mounted` | fs | info | mount ready (`mountpoint`, `inotify`, `fuse_control` = `/sys/fs/fuse/connections/<id>`, or `unknown`); also logged by the FUSE `init` callback (`openat2`, `read_only`) |
 | `filesystem_unmounted` | fs | info | shutdown started (`loop_status`) |
 | `filesystem_handles_released` | fs | info | at shutdown, file and directory handles still open (no RELEASE received) were freed (`files`, `directories`) |
 | `filesystem_operation_failed` | fs, gc, metrics | trace to critical | an operation failed: trace for ordinary client errors, debug for refused path resolutions, warning for unexpected errors and scan errors, critical when signal handlers cannot be installed |
@@ -249,6 +299,9 @@ the event is unquoted, so `grep 'event=gc_file_deleted'` works; in JSON use
 | `gc_retry_scheduled` | gc | debug | transient failure, retry scheduled (`attempt`, `errno`, `delay`) |
 | `gc_delete_failed` | gc | warning | deletion failed permanently or retries exhausted (`errno`, `error`) |
 | `gc_queue_saturated` | gc | warning | scheduler full (`capacity`) |
+| `gc_purge_requested` | gc | info | `SIGUSR2` received (`tsfs --purge`, or the signal sent directly) |
+| `gc_purge_started` | gc | info | the purge began (`dry_run`) |
+| `gc_purge_completed` | gc | info | the purge finished (`deleted`, `would_delete`, `failed`, `skipped_open`, `passes` = complete reconciliation passes run) |
 | `log_rotation_started` | logging | debug | a rotation of the active file began |
 | `log_rotation_completed` | logging | info | rotation done |
 | `log_repair_completed` | logging | warning | an interrupted compression was repaired when the log file was opened (startup or reconfiguration) |
@@ -281,7 +334,8 @@ messages per key and per minute are written, and the next written message carrie
 | Configuration change rejected | `event=config_reload_failed` | fix the file (`tsfs --check-config`), reload again; until then the old policy is applied |
 | Restart-only setting changed | `event=config_restart_required` | restart the service to apply it |
 | Deletions failing | `event=gc_delete_failed`, or `gc.failed` increasing | check `errno`: permissions, read-only backing filesystem, I/O errors |
-| Scheduler saturated | `event=gc_queue_saturated`, or `gc.queue_saturations` increasing | raise `max_pending_tasks`, raise `max_workers` or `max_deletions_per_second`, or lower `scan_interval` |
+| Scheduler saturated | `event=gc_queue_saturated`, or `gc.queue_saturations` increasing | raise `max_pending_tasks`, raise `max_workers` or `max_deletions_per_second`, or lower `scan_interval` (during a purge, saturations are expected on a large backlog: the purge runs further passes) |
+| Purge with failures | `event=gc_purge_completed` with `failed` > 0, or `gc.last_purge.failed` > 0 | same causes as deletions failing; `tsfs --purge` also exits with status 1 |
 | Unsafe paths | `event=gc_file_skipped` with `reason="unsafe"` | something replaced a directory with a symbolic link or mounted a filesystem inside the backing tree |
 | Unexpected filesystem errors | `event=filesystem_operation_failed` at `WARNING` or above | check the backing filesystem (`errno`, `op`, `path`) |
 | Log loss | `event=log_queue_overflow`, `event=log_write_failed`, `logging.lost_writes` or `logging.queue_overruns` increasing | free space in the log directory, raise `logging.async.queue_size`, or use `overflow_policy: block` |
@@ -289,6 +343,7 @@ messages per key and per minute are written, and the next written message carrie
 | Crash reports not armed | `event=diagnostics_unavailable` | check `diagnostics.crash_directory` |
 | Daemon crashed | `event=diagnostic_report_started` or `diagnostic_report_failed` in the journal, a new `tsfs-crash-*.txt` in `diagnostics.crash_directory`, or a restart reported by systemd | see the user guide, "Crash diagnostics" |
 | Status file stale | `updated_unix_ms` older than 3 x `metrics.interval`, or `pid` not running | the daemon is stopped or hung |
+| Requests piling up in the kernel | `fuse.waiting` high for several status updates, or `/sys/fs/fuse/connections/<id>/waiting` read directly when the status file itself is stale | the daemon is overloaded or hung; check `tsfs --status`, the journal, then restart; `abort` (see section 3) as a last resort |
 | No progress | `gc.last_reconciliation_unix_ms` older than a few `scan_interval` while `gc` is enabled | scans are slow or blocked; compare `last_scan_duration_ms` with `scan_interval` |
 
 ## 7. Suggested checks

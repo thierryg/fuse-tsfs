@@ -16,6 +16,7 @@
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <array>
@@ -164,6 +165,12 @@ metrics: {{status_file: "{}", interval: 1s}}
     }
 
     void start() {
+        spawn();
+        ASSERT_TRUE(eventually([&] { return is_mounted(mnt_); })) << test::read_file(dir_ / "tsfs.out");
+    }
+
+    /// Start the daemon without waiting for the mount.
+    void spawn() {
         std::vector<std::string> args{TSFS_BINARY, "--config", config_.string(), "--foreground"};
         std::vector<char*> argv;
         for (auto& a : args) {
@@ -197,7 +204,6 @@ metrics: {{status_file: "{}", interval: 1s}}
         envp.push_back(nullptr);
         ASSERT_EQ(posix_spawn(&pid_, argv[0], &actions, nullptr, argv.data(), envp.data()), 0);
         posix_spawn_file_actions_destroy(&actions);
-        ASSERT_TRUE(eventually([&] { return is_mounted(mnt_); })) << test::read_file(dir_ / "tsfs.out");
     }
 
     void stop() {
@@ -513,6 +519,145 @@ metrics: {{status_file: "{}"}}
     EXPECT_TRUE(is_mounted(mnt_));  // The first instance keeps serving.
     test::write_file(mnt_ / "still-served", "ok");
     EXPECT_EQ(test::read_file(data_ / "still-served"), "ok");
+}
+
+/// The status file names the kernel FUSE connection of the mount (fusectl).
+TEST_F(MountTest, StatusFileNamesTheFuseConnection) {
+    struct stat st{};
+    ASSERT_EQ(::stat(mnt_.c_str(), &st), 0);
+    const auto expected = (major(st.st_dev) << 20U) | minor(st.st_dev);
+    ASSERT_TRUE(eventually([&] { return status_json().find("\"fuse\": {") != std::string::npos; }));
+    const std::string status = status_json();
+    EXPECT_NE(status.find(std::format("\"connection_id\": {}, \"control_dir\": \"/sys/fs/fuse/connections/{}\"",
+                                      expected, expected)),
+              std::string::npos)
+        << status;
+    // waiting is a number where fusectl is mounted (hosts), null otherwise (containers).
+    const bool fusectl = fs::exists(std::format("/sys/fs/fuse/connections/{}/waiting", expected));
+    EXPECT_EQ(status.find("\"waiting\": null") == std::string::npos, fusectl) << status;
+}
+
+/// Regression: a signal received during startup (before the handlers exist) must not
+/// kill the daemon with the default action and leave a dead mount (ENOTCONN): the
+/// signals are blocked from the start, so SIGTERM ends in a clean unmount, exit 0.
+TEST_F(MountTest, SigtermDuringStartupUnmountsCleanly) {
+    stop();
+    for (int i = 0; i < 10; ++i) {
+        std::filesystem::remove(dir_ / "tsfs.out");
+        spawn();
+        // As early as possible: once the daemon announces the mount.
+        ASSERT_TRUE(eventually(
+            [&] { return test::read_file(dir_ / "tsfs.out").find("filesystem_mount_started") != std::string::npos; }));
+        ::kill(pid_, SIGTERM);
+        int status = 0;
+        ::waitpid(pid_, &status, 0);
+        pid_ = -1;
+        EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << "iteration " << i << ", status " << status << "\n"
+                                                                   << test::read_file(dir_ / "tsfs.out");
+        EXPECT_FALSE(is_mounted(mnt_)) << "iteration " << i << ": mount left behind";
+        if (is_mounted(mnt_)) {
+            const std::string cmd = "fusermount3 -u -z '" + mnt_.string() + "'";
+            [[maybe_unused]] const int rc = std::system(cmd.c_str());
+        }
+    }
+}
+
+/// Read-only retention attributes: what the GC will do with each file.
+TEST_F(MountTest, RetentionExtendedAttributes) {
+    const auto get = [](const fs::path& p, const char* name) -> std::string {
+        std::array<char, 256> buffer{};
+        const ssize_t n = ::getxattr(p.c_str(), name, buffer.data(), buffer.size());
+        return n < 0 ? "errno:" + std::to_string(errno) : std::string(buffer.data(), static_cast<std::size_t>(n));
+    };
+    test::write_file(mnt_ / "rec/clip.mp4", "x");   // rule rec: 2s
+    test::write_file(mnt_ / "rec/hold.keep", "x");  // exclude rule keep
+    test::write_file(mnt_ / "other.txt", "x");      // default: never
+    EXPECT_EQ(get(mnt_ / "rec/clip.mp4", "user.tsfs.state"), "expires");
+    EXPECT_EQ(get(mnt_ / "rec/clip.mp4", "user.tsfs.rule"), "rec");
+    EXPECT_EQ(get(mnt_ / "rec/clip.mp4", "user.tsfs.created").size(), 20U);  // Birth time (or mtime), UTC.
+    const std::string expires = get(mnt_ / "rec/clip.mp4", "user.tsfs.expires");
+    EXPECT_EQ(expires.size(), 20U) << expires;  // 2026-10-13T12:00:00Z
+    EXPECT_EQ(expires.back(), 'Z') << expires;
+    EXPECT_EQ(get(mnt_ / "rec/hold.keep", "user.tsfs.state"), "excluded");
+    EXPECT_EQ(get(mnt_ / "rec/hold.keep", "user.tsfs.rule"), "keep");
+    EXPECT_EQ(get(mnt_ / "rec/hold.keep", "user.tsfs.expires"), "errno:" + std::to_string(ENODATA));
+    EXPECT_EQ(get(mnt_ / "other.txt", "user.tsfs.state"), "never");
+    EXPECT_EQ(get(mnt_ / "other.txt", "user.tsfs.rule"), "default");
+    EXPECT_EQ(get(mnt_ / "rec", "user.tsfs.state"), "errno:" + std::to_string(ENODATA));  // Directories: none.
+    EXPECT_EQ(get(mnt_ / "other.txt", "user.other"), "errno:" + std::to_string(ENODATA));
+    EXPECT_NE(::setxattr((mnt_ / "other.txt").c_str(), "user.tsfs.state", "never", 5, 0), 0);  // Read-only.
+    // Not listed (GNU ls would print a "+" after the mode of every file): read by name only.
+    std::array<char, 256> list{};
+    EXPECT_EQ(::listxattr((mnt_ / "rec/clip.mp4").c_str(), list.data(), list.size()), 0);
+}
+
+/// tsfs --purge --force asks the running daemon (SIGUSR2) to delete every expired file
+/// now, whatever the rate limit; tsfs --stats counts the files per rule.
+TEST_F(MountTest, PurgeCommandDeletesExpiredFilesThroughTheDaemon) {
+    stop();
+    std::string config = test::read_file(config_);
+    for (const auto& [from, to] : {std::pair<std::string, std::string>{"scan_interval: 1s", "scan_interval: 1h"},
+                                   {"max_deletions_per_second: 0", "max_deletions_per_second: 1"}}) {
+        ASSERT_NE(config.find(from), std::string::npos);
+        config.replace(config.find(from), from.size(), to);
+    }
+    test::write_file(config_, config);
+    for (int i = 0; i < 20; ++i) {
+        test::write_file(data_ / "rec" / std::format("old-{}", i), "x");
+        test::set_mtime(data_ / "rec" / std::format("old-{}", i), test::kEpoch2026);  // Long expired.
+    }
+    test::write_file(data_ / "rec/hold.keep", "x");
+    test::set_mtime(data_ / "rec/hold.keep", test::kEpoch2026);
+    start();
+    const auto run = [&](std::string_view args) {
+        const std::string out = (dir_ / "cli.out").string();
+        const int status = std::system(
+            std::format("'{}' {} -c '{}' > '{}' 2>&1 < /dev/null", TSFS_BINARY, args, config_.string(), out).c_str());
+        return std::pair{WIFEXITED(status) ? WEXITSTATUS(status) : -1, test::read_file(out)};
+    };
+    const auto [stats_rc, stats] = run("--stats");
+    EXPECT_EQ(stats_rc, 0) << stats;
+    EXPECT_NE(stats.find("rec"), std::string::npos) << stats;
+    const auto [purge_rc, purge] = run("--purge --force");
+    EXPECT_EQ(purge_rc, 0) << purge;
+    EXPECT_NE(purge.find("file(s) deleted"), std::string::npos) << purge;
+    std::size_t left = 0;
+    for ([[maybe_unused]] const auto& e : fs::directory_iterator(data_ / "rec")) {
+        ++left;
+    }
+    EXPECT_EQ(left, 1U);  // Only the excluded file.
+    EXPECT_TRUE(fs::exists(data_ / "rec/hold.keep"));
+    EXPECT_NE(test::read_file(dir_ / "logs/tsfs.log").find("event=gc_purge_completed"), std::string::npos);
+}
+
+/// tsfs-ls: on a terminal inside a TSFS mount, the retention of each file is shown;
+/// in a pipe, the output is exactly the original ls (scripts are unaffected).
+TEST_F(MountTest, TsfsLsShowsRetentionOnATerminalAndDelegatesOtherwise) {
+    if (std::system("command -v script > /dev/null 2>&1") != 0 || !fs::exists("/usr/bin/ls")) {
+        GTEST_SKIP() << "needs script(1) (util-linux) and /usr/bin/ls";
+    }
+    test::write_file(mnt_ / "rec/clip.mp4", "x");
+    test::write_file(mnt_ / "rec/hold.keep", "x");
+    const std::string out = (dir_ / "ls.out").string();
+    const auto shell = [&](const std::string& command) {
+        const int rc = std::system(std::format("TSFS_REAL_LS=/usr/bin/ls {} > '{}' 2>&1", command, out).c_str());
+        EXPECT_EQ(rc, 0) << command << "\n" << test::read_file(out);
+        return test::read_file(out);
+    };
+    // script(1) gives tsfs-ls a terminal.
+    const std::string tty =
+        shell(std::format("script -qec \"'{}' -l '{}'\" /dev/null", TSFS_LS_BINARY, (mnt_ / "rec").string()));
+    EXPECT_NE(tty.find("clip.mp4  created "), std::string::npos) << tty;
+    EXPECT_NE(tty.find(", filter rec, deleted "), std::string::npos) << tty;
+    EXPECT_NE(tty.find("hold.keep  UNFILTERED"), std::string::npos) << tty;
+    // Options are those of the system ls (here: -R and an ignore pattern).
+    const std::string recursive =
+        shell(std::format("script -qec \"'{}' -R -I '*.keep' '{}'\" /dev/null", TSFS_LS_BINARY, mnt_.string()));
+    EXPECT_EQ(recursive.find("hold.keep"), std::string::npos) << recursive;
+    EXPECT_NE(recursive.find("clip.mp4  created "), std::string::npos) << recursive;
+    const std::string piped = shell(std::format("'{}' -la '{}'", TSFS_LS_BINARY, (mnt_ / "rec").string()));
+    const std::string real = shell(std::format("/usr/bin/ls -la '{}'", (mnt_ / "rec").string()));
+    EXPECT_EQ(piped, real);
 }
 
 TEST_F(MountTest, CleanShutdownUnmountsAndExitsZero) {

@@ -29,15 +29,28 @@ enum ExitCode : int {
 };
 
 /// What the invocation asks for (mutually exclusive).
-enum class CliAction { run, check_config, show_config, dry_run, status, print_example_config, version, help };
+enum class CliAction {
+    run,
+    check_config,
+    show_config,
+    dry_run,
+    status,
+    purge,
+    stats,
+    print_example_config,
+    version,
+    help
+};
 
 /// Parsed command line.
 struct CliOptions {
     CliAction action{CliAction::run};
     std::string config_path{kDefaultConfigPath};
     bool foreground{false};
-    bool debug{false};       ///< --debug: foreground, level debug, console logging.
-    bool fuse_debug{false};  ///< --fuse-debug: libfuse request trace (foreground).
+    bool debug{false};          ///< --debug: foreground, level debug, console logging.
+    bool fuse_debug{false};     ///< --fuse-debug: libfuse request trace (foreground).
+    bool force{false};          ///< --force: --purge without confirmation.
+    bool purge_preview{false};  ///< --purge --dry-run: list what a purge would delete.
     ConfigOverrides overrides;
 };
 

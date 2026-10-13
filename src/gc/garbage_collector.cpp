@@ -177,6 +177,67 @@ void GarbageCollector::apply(std::shared_ptr<const GcSnapshot> snapshot) {
     }
 }
 
+void GarbageCollector::request_purge() {
+    {
+        std::scoped_lock lock(mutex_);
+        purge_requested_ = true;
+        wake_ = true;
+    }
+    coordinator_cv_.notify_one();
+}
+
+void GarbageCollector::run_purge(const GcSnapshot& snap, std::stop_token stop) {
+    purging_.store(true);
+    const GcStats before = stats();
+    deps_.log.log(LogLevel::info, "gc", "gc_purge_started", "purging every expired file now",
+                  {{"dry_run", snap.config.dry_run}});
+    constexpr int kMaxPasses = 1000;  // Bound: each pass removes up to max_pending_tasks files.
+    int passes = 0;
+    for (; passes < kMaxPasses && !stop.stop_requested(); ++passes) {
+        const std::uint64_t saturations = counters_.queue_saturations.load(std::memory_order_relaxed);
+        scanner_.reset();
+        scanner_.set_want_birth(snap.policy->needs_birth_time());
+        scan_started_ = SteadyClock::now();
+        do {
+            drain_events(snap);
+            scan_slice(snap, SteadyClock::now() + snap.config.max_scan_duration);
+            dispatch_due(snap, /*unlimited=*/true);
+        } while (scanner_.in_progress() && !stop.stop_requested());
+        // Drain: everything due now is dispatched and processed.
+        for (;;) {
+            dispatch_due(snap, /*unlimited=*/true);
+            std::unique_lock lock(mutex_);
+            const auto due = scheduler_->next_due();
+            const bool due_now = due && *due <= deps_.clock.now();
+            if ((!due_now && work_.empty() && in_flight_ == 0) || stop.stop_requested()) {
+                break;
+            }
+            coordinator_cv_.wait_for(lock, stop, std::chrono::milliseconds(10), [this] { return wake_; });
+            wake_ = false;
+        }
+        if (counters_.queue_saturations.load(std::memory_order_relaxed) == saturations) {
+            ++passes;
+            break;  // Nothing was left out of the scheduler: every expired file was seen.
+        }
+    }
+    next_scan_ = SteadyClock::now() + snap.config.scan_interval;
+    const GcStats after = stats();
+    // Published before the completion counter: a reader that sees the new
+    // purges_completed also sees these values (both in the same status document).
+    counters_.last_purge_deleted.store(after.deleted - before.deleted, std::memory_order_relaxed);
+    counters_.last_purge_bytes.store(after.bytes_deleted - before.bytes_deleted, std::memory_order_relaxed);
+    counters_.last_purge_failed.store(after.failed - before.failed, std::memory_order_relaxed);
+    counters_.last_purge_skipped_open.store(after.skipped_open - before.skipped_open, std::memory_order_relaxed);
+    counters_.purges_completed.fetch_add(1, std::memory_order_release);
+    purging_.store(false);
+    deps_.log.log(LogLevel::info, "gc", "gc_purge_completed", "purge completed",
+                  {{"deleted", after.deleted - before.deleted},
+                   {"would_delete", after.would_delete - before.would_delete},
+                   {"failed", after.failed - before.failed},
+                   {"skipped_open", after.skipped_open - before.skipped_open},
+                   {"passes", passes}});
+}
+
 void GarbageCollector::notify_changed(std::string_view path) {
     {
         std::scoped_lock lock(mutex_);
@@ -262,12 +323,12 @@ void GarbageCollector::drain_events(const GcSnapshot& snap) {
     }
 }
 
-std::size_t GarbageCollector::dispatch_due(const GcSnapshot& snap) {
+std::size_t GarbageCollector::dispatch_due(const GcSnapshot& snap, bool unlimited) {
     std::vector<GcCandidate> due;
     {
         std::scoped_lock lock(mutex_);
         std::size_t room = work_capacity_ > work_.size() ? work_capacity_ - work_.size() : 0;
-        if (snap.config.max_deletions_per_cycle != 0) {
+        if (!unlimited && snap.config.max_deletions_per_cycle != 0) {
             const std::uint64_t left = snap.config.max_deletions_per_cycle > dispatched_in_cycle_
                                            ? snap.config.max_deletions_per_cycle - dispatched_in_cycle_
                                            : 0;
@@ -345,9 +406,18 @@ void GarbageCollector::coordinator(std::stop_token stop) {
             scanner_.reset();
             scanner_.set_want_birth(snap->policy->needs_birth_time());
         }
+        bool purge = false;
+        {
+            std::scoped_lock lock(mutex_);
+            purge = std::exchange(purge_requested_, false);
+        }
+        if (purge) {
+            run_purge(*snap, stop);
+            continue;
+        }
         if (!snap->config.enabled) {
             std::unique_lock lock(mutex_);
-            coordinator_cv_.wait(lock, stop, [this] { return snapshot_changed_; });
+            coordinator_cv_.wait(lock, stop, [this] { return snapshot_changed_ || purge_requested_; });
             continue;
         }
         drain_events(*snap);
@@ -421,7 +491,7 @@ void GarbageCollector::worker(std::stop_token stop, unsigned index) {
         coordinator_cv_.notify_one();
         const auto t0 = SteadyClock::now();
         for (GcCandidate& candidate : batch) {
-            if (!bucket_.acquire(stop)) {
+            if (stop.stop_requested() || (!purging_.load(std::memory_order_relaxed) && !bucket_.acquire(stop))) {
                 break;  // Shutdown: the rest is found again by the next start's first pass.
             }
             const auto snap = snapshot_.load();
@@ -692,6 +762,14 @@ GcStats GarbageCollector::stats() const {
     s.failed = c.failed.load(r);
     s.retries = c.retries.load(r);
     s.queue_saturations = c.queue_saturations.load(r);
+    // Acquire, paired with the release increment in run_purge(): last_purge_* read
+    // below belong to (at least) this purge.
+    s.purges_completed = c.purges_completed.load(std::memory_order_acquire);
+    s.last_purge_deleted = c.last_purge_deleted.load(r);
+    s.last_purge_bytes = c.last_purge_bytes.load(r);
+    s.last_purge_failed = c.last_purge_failed.load(r);
+    s.last_purge_skipped_open = c.last_purge_skipped_open.load(r);
+    s.purging = purging_.load(r) ? 1 : 0;
     s.events_dropped = c.events_dropped.load(r);
     s.scans_completed = c.scans_completed.load(r);
     s.last_scan_files = c.last_scan_files.load(r);

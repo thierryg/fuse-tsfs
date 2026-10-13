@@ -23,10 +23,10 @@ Related: [overview](overview.md), [filesystem](filesystem.md),
 |---|---|---|---|
 | main | process | 1 | Startup, `fuse_loop_mt` (receives SIGINT/SIGTERM), shutdown. |
 | libfuse workers | `fuse_loop_mt` (`FuseSession::loop`) | dynamic, 10 idle kept (`fuse_loop_cfg_set_idle_threads(10)`) | Execute `PassthroughFs` operations concurrently. |
-| `tsfs-gc` | `GarbageCollector::start` | 1 | Coordinator: scan slices, event draining, dispatch. |
+| `tsfs-gc` | `GarbageCollector::start` | 1 | Coordinator: scan slices, event draining, dispatch; runs purges (`run_purge`). |
 | `tsfs-gc-w<N>` | `GarbageCollector::start_workers` | `max_workers` (1..64) | Validate and delete candidates. |
-| `tsfs-config` | `ConfigWatcher::start` | 1 | inotify/eventfd poll loop; runs reloads and SIGUSR1 status dumps. |
-| `tsfs-housekeep` | `Daemon::run` (`std::jthread`) | 1 | Every second: `Logger::maintenance()`; every `metrics.interval`: status file. |
+| `tsfs-config` | `ConfigWatcher::start` | 1 | inotify/eventfd poll loop; runs reloads, SIGUSR1 status dumps and SIGUSR2 purge requests (`request_purge`, non-blocking). |
+| `tsfs-housekeep` | `Daemon::run` (`std::jthread`) | 1 | Every second: `Logger::maintenance()`; every `metrics.interval`, and whenever a purge starts or ends: status file. |
 | `tsfs-log` | spdlog `thread_pool` in `Logger::configure` | 1 per pipeline, only with `logging.async.enabled` | Formats and writes queued messages into the sinks. |
 | `tsfs-logzip` | `LogCompressor` constructor | 1 per pipeline, only with `rotation.compress` | Compresses rotated files. |
 
@@ -50,13 +50,13 @@ stop request wakes them immediately.
 | `NoticeQueue::mutex_` | notice deque | sink, compressor (post); housekeeping (drain) |
 | `StderrFallback::mutex_` | rate-limit window | any thread reporting a logging failure |
 | `LogRateLimiter::mutex_` | per-key counters | GC, FUSE (`report_failure`) |
-| `GarbageCollector::mutex_` | scheduler, work queue, event queue, `in_flight_`, `wake_`, flags, dry-run set | coordinator, workers, FUSE (`notify_changed`), reload (`apply`), `stats()` |
+| `GarbageCollector::mutex_` | scheduler, work queue, event queue, `in_flight_`, `wake_`, flags (including `purge_requested_`), dry-run set | coordinator, workers, FUSE (`notify_changed`), reload (`apply`), `stats()` |
 | `GarbageCollector::workers_mutex_` | worker thread vector | start/stop/apply, `stats()` |
 | `TokenBucket::mutex_` | tokens and rate | workers, reload (`set_rate`) |
 | `PathLockTable` stripes (1024) | namespace changes of a name | FUSE operations, GC workers |
 | `OpenFileRegistry` shard mutexes (64) | per-identity open counts | FUSE `open`/`create`/`release`, GC validation |
 | `PassthroughFs::DirHandle::mutex` | one directory stream | concurrent `readdir` on the same handle |
-| `Daemon::status_mutex_` | `write_status()` (one status write at a time) | housekeeping thread (periodic), watcher thread (SIGUSR1), main (final status) |
+| `Daemon::status_mutex_` | `write_status()` (one status write at a time) | housekeeping thread (periodic and purge start/end), watcher thread (SIGUSR1), main (final status) |
 | housekeeping local mutex | condition-variable wait only | housekeeping thread |
 
 There is no recursive mutex and no reader/writer lock.
@@ -120,12 +120,13 @@ of ancestor sets against rename pairs.
 | `std::atomic<std::shared_ptr<const GcSnapshot>>` (`GarbageCollector::snapshot_`) | seq_cst | GC configuration + policy per generation. |
 | `std::atomic<std::shared_ptr<Pipeline>>` (`Logger::pipeline_`) | seq_cst | Logger pipeline swap; `log()` loads it without a lock. |
 | `Logger::level_` | relaxed | Level filter: a disabled level costs one load and one comparison. |
-| GC `Counters` (20 counters) | relaxed | Statistics only; `stats()` is not a consistent cut across counters. |
+| GC `Counters` (25 counters) | relaxed (`purges_completed`: release increment) | Statistics only; `stats()` is not a consistent cut across counters. `run_purge` stores the `last_purge_*` values before incrementing `purges_completed`. |
+| `GarbageCollector::purging_` | seq_cst stores, relaxed loads | Set by the coordinator for the duration of a purge; workers skip the token bucket while it is set; published as the `purging` gauge. |
 | `ShardedCounters<N>` (`src/metrics/sharded_counter.hpp`) | relaxed | FUSE call/error/byte counters (see below). |
 | `OpenFileRegistry::total_`, logger/sink/compressor counters, config reload counters | relaxed or seq_cst | Gauges and counters. |
 | `GarbageCollector::running_` | seq_cst | Idempotent `start`/`stop`. |
 | `Daemon::live_session_` (`std::atomic<FuseSession*>`) | seq_cst | Lets GC workers invalidate kernel caches only while the session is live. |
-| `g_reload_fd`, `g_status_fd` (`config_watcher.cpp`) | relaxed loads in handlers | eventfd numbers read by the SIGHUP/SIGUSR1 handlers. |
+| `g_reload_fd`, `g_status_fd`, `g_purge_fd` (`config_watcher.cpp`) | relaxed loads in handlers | eventfd numbers read by the SIGHUP/SIGUSR1/SIGUSR2 handlers. |
 | `g_installed`, `g_handling` (`crash_handler.cpp`) | seq_cst | Crash-handler installation; first crashing thread wins. |
 | `g_symbols` (`std::atomic<const SymbolTable*>`, `crash_handler.cpp`) | seq_cst | Symbol table loaded at installation, read (never modified) by the signal handler. |
 | `ConfigWatcher::watch_` (`std::atomic<int>`) | relaxed | inotify watch descriptor: written by the watcher thread, read by `inotify_active()` on the main thread. |
@@ -142,8 +143,13 @@ not a consistent snapshot, which is acceptable for statistics.
 Rules (`src/app/application.cpp`, `src/common/threads.cpp`,
 `src/config/config_watcher.cpp`, `src/diagnostics/crash_handler.cpp`):
 
-1. Before any helper thread is created, the main thread blocks `SIGINT`,
-   `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGPIPE`; TSFS helper threads
+1. The very first statement of `Daemon::run`, before the configuration is
+   loaded, the preflight checks, the mount and any helper thread, blocks `SIGINT`,
+   `SIGTERM`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGPIPE` in the main thread. A
+   signal received during startup therefore stays pending instead of taking its
+   default action (which would kill the daemon after the mount and leave a dead
+   mount behind, `ENOTCONN`); it is delivered when the loop starts, once the
+   handlers are installed (a `SIGTERM` then unmounts cleanly, exit 0). TSFS helper threads
    inherit that mask and additionally block every signal except the
    synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT`,
    `SIGTRAP`, `SIGSYS`) with `block_async_signals()`, so the crash handler
@@ -153,14 +159,15 @@ Rules (`src/app/application.cpp`, `src/common/threads.cpp`,
    the TSFS handlers are async-signal-safe whichever thread receives them.
 3. Handlers do the minimum:
    * SIGINT/SIGTERM: libfuse's handler ends the loop.
-   * SIGHUP/SIGUSR1: `on_sighup`/`on_sigusr1` save `errno`, load an eventfd
-     number from an atomic, `write(2)` 8 bytes, restore `errno`. Installed with
-     `SA_RESTART` after libfuse's handlers, so TSFS owns SIGHUP. All real work
-     (reload, status) happens on the watcher thread.
+   * SIGHUP/SIGUSR1/SIGUSR2: `on_sighup`/`on_sigusr1`/`on_sigusr2` save
+     `errno`, load an eventfd number from an atomic, `write(2)` 8 bytes, restore
+     `errno`. Installed with `SA_RESTART` after libfuse's handlers, so TSFS owns
+     SIGHUP. All real work (reload, status, purge request) happens on the
+     watcher thread; the purge itself runs on the GC coordinator.
    * Fatal signals: `fatal_handler` runs on the alternate stack (`SA_ONSTACK`)
      and uses only async-signal-safe calls (see [diagnostics](diagnostics.md)).
 4. At shutdown the asynchronous set is blocked again before teardown and the
-   SIGHUP/SIGUSR1 dispositions are restored to `SIG_DFL`.
+   SIGHUP/SIGUSR1/SIGUSR2 dispositions are restored to `SIG_DFL`.
 
 ## 6. Shutdown ordering
 
@@ -169,7 +176,7 @@ only when no thread can use it any more:
 
 ```
  fuse_loop_mt returns (libfuse joins its workers)
-   1. block async signals; SIGHUP/SIGUSR1 -> SIG_DFL
+   1. block async signals; SIGHUP/SIGUSR1/SIGUSR2 -> SIG_DFL
    2. ConfigWatcher::stop()          no more reloads or status dumps
    3. housekeeping: request_stop + join
    4. live_session_ = nullptr        GC stops calling fuse_invalidate_path
@@ -206,3 +213,15 @@ reconfiguration and shutdown.
   `snapshot_` (`exchange(std::move(snapshot))`) after copying the GC section it
   needs, instead of copying the `shared_ptr`.
 * **Logger pipeline destruction**: see section 6.
+* **Signal during startup.** The asynchronous signals used to be blocked too
+  late in the startup sequence: a `SIGTERM` or `SIGHUP` arriving before the
+  handlers were installed killed the daemon with the default action and, after
+  the mount, left a dead mount (`ENOTCONN`). A pending `SIGHUP` is now handled
+  as a reload once the loop runs. They are now blocked at the very start of `Daemon::run` (section
+  5). Found by ThreadSanitizer runs on 2 CPUs (simulating CI); regression test
+  `MountTest.SigtermDuringStartupUnmountsCleanly`, verified to fail without the
+  fix.
+* **Purge flags.** `purge_requested_` is a plain `bool` guarded by
+  `GarbageCollector::mutex_` (set by `request_purge()` on the watcher thread,
+  consumed with `std::exchange` by the coordinator); `purging_` is an atomic
+  because workers read it without the mutex for every candidate.

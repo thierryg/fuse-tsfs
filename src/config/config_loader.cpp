@@ -236,7 +236,7 @@ TimestampSource parse_timestamp(const Reader& r, const YAML::Node& node, const s
 
 void parse_filesystem(const Reader& r, const YAML::Node& node, FilesystemConfig& fs) {
     const std::string k = "filesystem";
-    r.expect_map(node, k, {"mountpoint", "backing_directory", "mode", "allow_other", "read_only"});
+    r.expect_map(node, k, {"mountpoint", "backing_directory", "mode", "allow_other", "read_only", "retention_xattrs"});
     with(node, "mountpoint", [&](const YAML::Node& n) { fs.mountpoint = r.host_path(n, k + ".mountpoint"); });
     with(node, "backing_directory",
          [&](const YAML::Node& n) { fs.backing_directory = r.host_path(n, k + ".backing_directory"); });
@@ -245,6 +245,8 @@ void parse_filesystem(const Reader& r, const YAML::Node& node, FilesystemConfig&
     });
     with(node, "allow_other", [&](const YAML::Node& n) { fs.allow_other = r.boolean(n, k + ".allow_other"); });
     with(node, "read_only", [&](const YAML::Node& n) { fs.read_only = r.boolean(n, k + ".read_only"); });
+    with(node, "retention_xattrs",
+         [&](const YAML::Node& n) { fs.retention_xattrs = r.boolean(n, k + ".retention_xattrs"); });
     if (fs.mountpoint == "/" || fs.backing_directory == "/") {
         r.fail(node, k, "neither the mount point nor the backing directory may be '/'");
     }
@@ -705,6 +707,7 @@ std::string dump_config(const Config& c) {
     out << YAML::Key << "mode" << YAML::Value << "passthrough";
     out << YAML::Key << "allow_other" << YAML::Value << c.filesystem.allow_other;
     out << YAML::Key << "read_only" << YAML::Value << c.filesystem.read_only;
+    out << YAML::Key << "retention_xattrs" << YAML::Value << c.filesystem.retention_xattrs;
     out << YAML::EndMap;
 
     out << YAML::Key << "retention" << YAML::Value << YAML::BeginMap;

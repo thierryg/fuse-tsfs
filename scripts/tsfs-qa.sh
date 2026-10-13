@@ -44,7 +44,9 @@ usage() {
 
 # preset_build_test PRESET: configure, build and run the tests of one preset.
 preset_build_test() {
-  cmake --preset "$1" >/dev/null
+  # --fresh: the cache is rebuilt from the current defaults (a stale cache once hid a
+  # changed default, the sanitizers of Debug trees); objects are reused when unchanged.
+  cmake --preset "$1" --fresh >/dev/null
   cmake --build "build/$1" -j"$JOBS"
   ctest --test-dir "build/$1" -j"$JOBS" --output-on-failure
 }
@@ -54,7 +56,7 @@ cxx_sources() {
 }
 
 step_deps() {
-  cmake --preset release >/dev/null
+  cmake --preset release --fresh >/dev/null
   cmake -DPROFILES="build;test;bench;doc;coverage;diagnostics;qa" -DCXX26_OK=1 -DCXX_COMPILER_ID=check \
         -DCXX_COMPILER_VERSION=check -P CMake/CheckDeps.cmake
   cmake --build build/release --target deps
@@ -72,7 +74,7 @@ step_debug() { preset_build_test debug; }
 step_clang() { preset_build_test clang; }
 step_tidy() {
   require_cmd run-clang-tidy
-  [[ -f build/clang/compile_commands.json ]] || cmake --preset clang >/dev/null
+  cmake --preset clang --fresh >/dev/null
   local out
   # Production code only (tests use gtest idioms that the checks do not target).
   out="$(run-clang-tidy -p build/clang -quiet -j"$JOBS" "^$PWD/(src|benchmarks)/" 2>/dev/null |
@@ -84,14 +86,14 @@ step_tidy() {
 }
 step_tsan() { preset_build_test tsan; }
 step_coverage() {
-  cmake --preset coverage >/dev/null
+  cmake --preset coverage --fresh >/dev/null
   cmake --build build/coverage -j"$JOBS"
   cmake --build build/coverage --target coverage-reset
   cmake --build build/coverage --target tests
   cmake --build build/coverage --target coverage
 }
 step_doc() {
-  cmake --preset release >/dev/null
+  cmake --preset release --fresh >/dev/null
   cmake --build build/release --target doc
 }
 

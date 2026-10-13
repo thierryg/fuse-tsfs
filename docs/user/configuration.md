@@ -172,7 +172,7 @@ content hash comparison). A reload is atomic:
 
 The restart-only settings are exactly: `filesystem.mountpoint`,
 `filesystem.backing_directory`, `filesystem.allow_other`, `filesystem.read_only`,
-all keys of `diagnostics`, and all keys of `security` (`src/config/config_manager.cpp`,
+`filesystem.retention_xattrs`, all keys of `diagnostics`, and all keys of `security` (`src/config/config_manager.cpp`,
 `keep_static_settings`).
 
 Command-line options override the file for the whole life of the process,
@@ -202,7 +202,7 @@ exist.
 `-f`, `-d`, `--fuse-debug` and the diagnostics options (`--stack-trace`,
 `--no-stack-trace`, `--core-dump`, `--no-core-dump`) only apply when mounting:
 combined with an action (`--check-config`, `--show-config`, `--dry-run`,
-`--status`), they are rejected with exit status 2.
+`--status`, `--stats`, `--purge`), they are rejected with exit status 2.
 
 ## 4. `version`
 
@@ -223,6 +223,7 @@ rejected (`unsupported configuration version`).
 | `mode`              | string    | `passthrough`        | `passthrough`           | restart |
 | `allow_other`       | boolean   | `false`              | `true`, `false`         | restart |
 | `read_only`         | boolean   | `false`              | `true`, `false`         | restart |
+| `retention_xattrs`  | boolean   | `true`               | `true`, `false`         | restart |
 
 - `mountpoint`: directory where the filesystem is mounted. It must exist and be a
   directory when the daemon starts (TSFS does not create it).
@@ -237,6 +238,21 @@ rejected (`unsupported configuration version`).
   kernel against file ownership and mode (`default_permissions` is always set).
 - `read_only`: mounts the filesystem read-only (`ro`). The garbage collector still
   deletes expired files in the backing directory.
+- `retention_xattrs`: serves four read-only virtual extended attributes on every
+  regular file of the mount: `user.tsfs.state` (`expires`, `expired`, `excluded` or
+  `never`), `user.tsfs.expires` (expiry in ISO 8601 UTC, only when the file
+  expires), `user.tsfs.rule` (identifier of the deciding rule, or `default`) and
+  `user.tsfs.created` (birth time of the backing file in ISO 8601 UTC, or its
+  modification time when the backing filesystem does not report it).
+  They are read by name (`getfattr -n user.tsfs.state FILE`, `getxattr(2)`) and
+  are what the `tsfs-ls` wrapper (the system `ls` by default) displays; `listxattr` returns an empty list on purpose (see the
+  user guide, "Retention of a file"). Cost: once the FUSE `getxattr` callback
+  exists, the kernel sends one `getxattr` request (`security.capability`) before
+  each write request; small-file workloads measured about 28 % fewer
+  create-and-write operations per second (see
+  [benchmark-report.md](../performance/benchmark-report.md)). `false` removes the
+  `getxattr` and `listxattr` callbacks: no extra round trip, but no retention
+  attributes, so `tsfs-ls` tags every entry `UNFILTERED`.
 
 ## 6. `retention`
 
@@ -385,11 +401,14 @@ through a complete example with its dry-run output.
 | `scheduler`                | string   | `heap`   | `heap`, `ordered`             | reload |
 
 - `enabled`: when `false`, the garbage collector does nothing (no scan, no deletion)
-  until it is re-enabled by a reload. The filesystem keeps working.
+  until it is re-enabled by a reload. The filesystem keeps working. An explicit
+  purge (`tsfs --purge`, `SIGUSR2`) still runs: the workers are always started.
 - `dry_run`: the garbage collector performs every check of a real deletion, then logs
   `event=gc_candidate_found ... dry_run=true msg="dry run: would delete"` once per
   file instead of deleting it, and increments the `would_delete` counter. The
   example configuration installed as `/etc/tsfs/config.yml` sets `dry_run: true`.
+  It also applies to a purge: with `dry_run: true`, `tsfs --purge` refuses to run
+  (exit status 7), and a purge requested with `SIGUSR2` deletes nothing.
 - `scan_interval`: time between the starts of two reconciliation passes over the
   whole backing tree. Files whose expiry falls within twice this interval are
   scheduled individually and deleted at their expiry; later expiries are found again
@@ -404,6 +423,9 @@ through a complete example with its dry-run output.
 - `max_deletions_per_cycle`: maximum number of candidates dispatched to the workers
   per scan cycle. `0` means unlimited. Remaining candidates wait for the next
   cycle.
+
+  Neither limit applies to an explicit purge (`tsfs --purge`, `SIGUSR2`), which
+  deletes every expired file at once.
 - `max_pending_tasks`: capacity of the expiration scheduler. When it is full, new
   candidates are rejected (counted in `queue_saturations`, logged as
   `gc_queue_saturated`) and found again by the next pass, so memory stays bounded.
@@ -551,7 +573,9 @@ on crash diagnostics and core-dump analysis.
 | `status_file` | host path | `/run/tsfs/status.json` | absolute path  | reload |
 | `interval`    | duration  | `10s`                   | >= `1s`        | reload |
 
-- `enabled`: write the status file periodically, on `SIGUSR1`, and at shutdown.
+- `enabled`: write the status file periodically, on `SIGUSR1`, when a purge starts
+  or ends, and at shutdown. `tsfs --purge` needs it to find and follow the running
+  daemon: with `enabled: false`, a purge of a mounted mount point is refused.
 - `status_file`: JSON status document, written atomically (temporary file then
   rename): the temporary file is created with an unpredictable name and `O_EXCL`
   (`mkostemp`), set to mode 0640, then renamed over the status file. Its directory
@@ -618,6 +642,7 @@ filesystem:
   mode: passthrough
   allow_other: false
   read_only: false
+  retention_xattrs: true
 retention:
   default: "never"
   timestamp: modification

@@ -44,7 +44,7 @@ Related documents:
 - [configuration.md](configuration.md): every configuration key, with types,
   defaults, ranges and reload behavior.
 - [monitoring.md](monitoring.md): status file, counters and log events.
-- The `tsfs(1)` manual page (`man tsfs`).
+- The `tsfs(1)` and `tsfs-ls(1)` manual pages (`man tsfs`, `man tsfs-ls`).
 - Architecture: [overview](../architecture/overview.md),
   [filesystem](../architecture/filesystem.md),
   [policy engine](../architecture/policy-engine.md),
@@ -94,6 +94,13 @@ Key properties:
 - **Dry run.** `tsfs --dry-run` lists what would be deleted now, without mounting
   and without deleting anything; `garbage_collector.dry_run: true` makes the daemon
   log instead of delete.
+- **Explicit purge and statistics.** `tsfs --purge` deletes every expired file at
+  once, without the rate limits; `tsfs --stats` counts files, bytes and upcoming
+  expiries per rule.
+- **Retention visible to users.** Each file of the mount carries read-only
+  attributes giving its state, expiry, deciding rule and creation time; the
+  `tsfs-ls` wrapper, installed as the system `ls` by default, tags each entry of a
+  listing with them.
 - **Observability.** Structured logs with stable event names, a JSON status file
   with counters, optional crash reports and core dumps.
 
@@ -170,10 +177,12 @@ Installation is a build from source followed by `cmake --install`:
 | Installed file (default prefix `/usr/local`)         | Notes |
 |------------------------------------------------------|-------|
 | `/usr/local/bin/tsfs`                                | daemon and command-line tool |
-| `/usr/local/share/man/man1/tsfs.1`                   | manual page |
+| `/usr/local/bin/tsfs-ls`                             | `ls` wrapper that tags the retention of each entry of a TSFS mount ([The TSFS ls](#the-tsfs-ls-replacing-the-system-ls)) |
+| `/usr/bin/ls` (wrapper), `/usr/bin/ls.orig`          | root installation without `DESTDIR` only, unless built with `-DTSFS_REPLACE_SYSTEM_LS=OFF`: the system `ls` is renamed `ls.orig` and the wrapper installed as `/usr/bin/ls`; the `uninstall` target renames `ls.orig` back |
+| `/usr/local/share/man/man1/tsfs.1`, `tsfs-ls.1`      | manual pages |
 | `/usr/local/share/doc/tsfs/`                         | README, CHANGELOG, LICENSE, SECURITY, user and security documentation |
 | `/usr/local/share/doc/tsfs/examples/config.example.yml` | commented example (refreshed at every install) |
-| systemd unit directory`/tsfs.service`                | from `pkg-config --variable=systemdsystemunitdir systemd`, else `<prefix>/lib/systemd/system`; installed **disabled** |
+| systemd unit directory`/tsfs.service`, `tsfs@.service` | from `pkg-config --variable=systemdsystemunitdir systemd`, else `<prefix>/lib/systemd/system`; installed **disabled** |
 | `/etc/tsfs/config.yml`                               | created from the example **only if absent**, mode 0640; never overwritten |
 
 The example configuration ships with `garbage_collector.dry_run: true`: a fresh
@@ -350,6 +359,107 @@ mount namespace, and a FUSE mount created there would be invisible to the rest o
 the system. Use a drop-in (`systemctl edit tsfs`) to adapt it, for example to pass
 another configuration file.
 
+### The TSFS ls replacing the system ls
+
+`tsfs-ls` is a small standalone wrapper around the system `ls` (it does not need
+the daemon or the TSFS library). It never lists anything itself: every listing is
+produced by the original `ls`, so all the options of the system `ls` keep their
+meaning. On a terminal, inside a TSFS mount, it appends the retention of each entry
+to the listing (see
+[Retention of a file](#retention-of-a-file-tsfs-ls-and-extended-attributes)).
+Everywhere else it runs the original `ls` with the unchanged command line.
+
+**By default, `sudo cmake --install` installs the wrapper as the system `ls`**, so
+that a plain `ls -l` in a mount shows when files will be deleted:
+
+- `tsfs-ls` is always installed as `<prefix>/bin/tsfs-ls`;
+- then, only when the installation runs as root and without `DESTDIR` (never for
+  staged or package installations), if `/usr/bin/ls` is the system `ls` (it does
+  not contain the marker string `TSFS-LS-WRAPPER`), it is **renamed**
+  `/usr/bin/ls.orig` (`rename(2)`, no copy). It may be a regular file (GNU
+  coreutils) or a symbolic link (Ubuntu 26.04: `/usr/bin/ls ->
+  ../lib/cargo/bin/coreutils/ls`, the uutils coreutils multi-call binary): a link
+  is renamed as is. The wrapper is then installed as `/usr/bin/ls` (copied to a
+  temporary name, mode 0755, then renamed: the replacement is atomic);
+- installing again when `/usr/bin/ls` is already the wrapper and `ls.orig` exists
+  only refreshes the wrapper. If a coreutils reinstallation or upgrade has put the
+  system `ls` back over the wrapper, that `ls` is renamed over the stale
+  `ls.orig`, then the wrapper is installed again;
+- if `/usr/bin/ls` is the wrapper but `/usr/bin/ls.orig` is missing, the
+  installation stops with an error asking to restore coreutils first: `sudo apt
+  install --reinstall coreutils`, then install again.
+
+The wrapper (`/usr/bin/ls`, or `/usr/local/bin/tsfs-ls`) runs the original `ls`
+with `execv` and the **unchanged command line**, so that scripts and pipes get
+exactly the output of the system `ls`, whenever:
+
+1. no operand (default `.`) is inside a TSFS mount (filesystem type `fuse.tsfs` in
+   `/proc/self/mountinfo`);
+2. standard output is not a terminal (pipes, redirections, command substitution);
+3. the environment contains `TSFS_LS=off`;
+4. the options include `--help`, `--version`, `--zero`, `--dired` or `-D`.
+
+Otherwise (an operand inside a TSFS mount, on a terminal, or with
+`TSFS_LS=always`), the listing is still produced by the original `ls`, run with
+the user's options followed by `-l --dired` (inserted before a `--`, so that a
+later `-C`, `-x` or `-m` cannot cancel the long format) and the operands. The dired trailer of
+`ls` (`//DIRED//`: byte offsets of every listed name; `//SUBDIRED//`: those of the
+directory headers; supported by GNU coreutils and uutils coreutils) tells exactly
+which entry is on which line, so sorting, `-a`/`-A`, `-R`, `-I`/`--hide`/`--ignore`,
+`--time-style`, `-i`, `-s`, `-n`, `-h`, several operands and glob patterns keep
+their meaning. Options that take their value as the next argument (`-I`, `-T`,
+`-w`, `--block-size`, `--format`, `--hide`, `--ignore`, `--indicator-style`,
+`--quoting-style`, `--sort`, `--tabsize`, `--time`, `--time-style`, `--width`) are
+recognized, so their value is not taken for an operand.
+
+- With a long format (`-l`, `-n`, `-g`, `-o`, `--format=long` or `verbose`), the
+  lines of the original `ls` are kept (without the two-space dired indentation) and
+  the tag is appended to each entry line.
+- With any other format, each entry is printed on its own line followed by its tag
+  (a column layout cannot carry it); the `total` lines are dropped, directory
+  headers and blank lines are kept.
+- If the output of the original `ls` has no dired trailer (an `ls` without
+  `--dired` support), it is printed unchanged, without tags. Verified with GNU
+  coreutils 8.32 and uutils coreutils 0.8.0, including `-C`, `-x`, `-m`, `-d`, `-o`.
+- With `filesystem.retention_xattrs: false`, every entry is tagged
+  `RETENTION UNKNOWN (filesystem.retention_xattrs is false)`.
+
+Colors are not shown in TSFS listings (the original `ls` writes to a pipe), and
+control characters in names are printed as `?`.
+
+The original `ls` is looked up in this order: `$TSFS_REAL_LS`, then
+`/usr/bin/ls.orig`, then the `PATH` (skipping the wrapper itself, recognized by its
+marker string `TSFS-LS-WRAPPER-v2`). It always runs with `argv[0]` set to `ls`:
+multi-call binaries such as uutils coreutils select the utility from it. When none
+is found, the wrapper prints `ls: the original ls cannot be found
+(/usr/bin/ls.orig missing; set TSFS_REAL_LS)` and exits with status 2.
+`/usr/bin/ls.orig` can also be run directly (GNU `ls` and uutils alike).
+
+To keep the system `ls`:
+
+- at build time: `cmake --preset release -DTSFS_REPLACE_SYSTEM_LS=OFF` (`tsfs-ls`
+  stays available under its own name; `-DTSFS_SYSTEM_LS=PATH` changes which `ls`
+  is wrapped, default `/usr/bin/ls`);
+- per shell or per user: `export TSFS_LS=off` (every call runs the original `ls`
+  unchanged);
+- afterwards: the `uninstall` target renames `ls.orig` back
+  ([chapter 22](#22-uninstallation)).
+
+Risks of the replacement, accepted by this default:
+
+- `/usr/bin/ls` belongs to the `coreutils` package: `dpkg --verify coreutils` and
+  `dpkg -S` based checks report it while the wrapper is in place, and a coreutils
+  upgrade puts the system `ls` back over the wrapper (the tags disappear; the next
+  TSFS installation renames it again).
+- `ls` is used by every user and many scripts: a defect of the wrapper would affect
+  them all. The pass-through rules limit this: scripts and pipes (no terminal) and
+  every directory outside TSFS mounts get the original `ls` unchanged, and inside
+  TSFS mounts the listing itself is still produced by the original `ls`.
+
+The procedure (install, reinstall, uninstall, with uutils coreutils 0.8.0 where
+`/usr/bin/ls` is a symbolic link) was verified as root in a disposable container:
+the uninstallation restores the identical link, with the same target.
+
 ## 8. Debug installation
 
 A Debug build is meant for development and for reproducing problems:
@@ -405,7 +515,7 @@ sections:
 | Section             | Purpose                                                | Reload |
 |---------------------|--------------------------------------------------------|--------|
 | `version`           | schema version, must be `1` (mandatory)                | n/a |
-| `filesystem`        | mount point, backing directory, `allow_other`, `read_only` | restart |
+| `filesystem`        | mount point, backing directory, `allow_other`, `read_only`, `retention_xattrs` | restart |
 | `retention`         | default lifetime, timestamp source, rules              | reload |
 | `garbage_collector` | enable, dry run, scan interval, workers, throttling, retries | reload |
 | `logging`           | file, level, format, async queue, rotation             | reload |
@@ -1155,6 +1265,9 @@ and flushes the log:
 ```
 
 The exit status is 0 for a shutdown by `SIGTERM`, `SIGINT` or an external unmount.
+A `SIGTERM` or `SIGINT` received while the daemon is still starting is held until
+the mount is ready, then handled the same way (clean unmount, exit 0): it never
+leaves a dead mount behind.
 
 Unmounting does not touch the data: files stay in the backing directory. When
 TSFS is started again, files that expired while it was stopped are deleted by the
@@ -1260,6 +1373,79 @@ with several links frees no space; such deletions count 0 bytes in
 
 Disable the garbage collector without unmounting by setting
 `garbage_collector.enabled: false` and reloading.
+
+### Purging expired files now: `tsfs --purge`
+
+The rate limits protect the storage, but can leave a backlog of expired files (for
+example after shortening a retention, or with `enabled: false`). `tsfs --purge`
+deletes **now** every file that is already expired:
+
+```sh
+sudo tsfs --purge --dry-run -c /etc/tsfs/config.yml   # preview: the --dry-run listing
+sudo tsfs --purge -c /etc/tsfs/config.yml             # asks for confirmation
+sudo tsfs --purge --force -c /etc/tsfs/config.yml     # scripts: no question
+```
+
+- `max_deletions_per_second` and `max_deletions_per_cycle` are ignored; every
+  other check of a regular deletion applies to each file (same inode, regular file
+  inside the managed tree, not open through the mount, still expired under the
+  current policy). Excluded files and files whose retention is `never` are never
+  touched; files that expire later are kept.
+- Complete reconciliation passes are repeated while the bounded scheduler
+  saturates, so a backlog larger than `max_pending_tasks` is purged too.
+- It works with `garbage_collector.enabled: false`.
+- With `garbage_collector.dry_run: true`, a purge would delete nothing: `tsfs
+  --purge` refuses with exit status 7 and a message pointing to the preview.
+
+**Who deletes.** Pass the same configuration (`-c`) as the daemon:
+
+- When a daemon serves the mount point, the purge is done by the daemon, the only
+  process that knows which files are open through the mount. `tsfs --purge` finds
+  it through `metrics.status_file` (its `pid` must be alive, the process must be
+  named `tsfs`, and its `mountpoint` must be the configured one), sends it
+  `SIGUSR2`, then follows the status file until the purge completes, printing
+  `... N file(s) deleted so far` every 5 seconds and finally:
+
+  ```text
+  purge requested from the daemon (pid 4242), waiting for it to finish...
+  purge: 300 file(s) deleted (600B), 0 failed, 0 kept because open through the mount
+  ```
+
+  The daemon logs `gc_purge_requested`, `gc_purge_started` and
+  `gc_purge_completed` (`deleted`, `would_delete`, `failed`, `skipped_open`,
+  `passes`), and rewrites the status file as soon as the purge starts and ends
+  (`gc.purging`, `gc.purges_completed`, `gc.last_purge`).
+- When no daemon serves the mount point (the mount point is not mounted), the CLI
+  process purges the backing directory itself, with the same garbage collector and
+  no rate limit, and prints `purge: N file(s) deleted (SIZE), F failed`.
+- When the mount point is mounted but its daemon cannot be found
+  (`metrics.enabled: false`, status file unreadable or stale, another `-c`), the
+  purge is refused (exit 7): an offline purge could delete files that are open
+  through the mount. Send `SIGUSR2` to the daemon instead.
+
+**Confirmation.** On a terminal, `tsfs --purge` asks `Delete now every expired file
+of <backing directory> ...? [y/N]`; any answer other than `y` or `yes` cancels
+(`purge cancelled`, exit 0). `--force` skips the question and is required when
+standard input is not a terminal (otherwise exit 2). `--force` with any other
+action, or with `--purge --dry-run`, is a usage error (exit 2). `--purge --dry-run`
+and `--dry-run --purge` are the same preview, exactly the listing of `tsfs
+--dry-run` ([chapter 15](#15-dry-run-mode)).
+
+**Exit status.** 0 done (or cancelled), 1 at least one deletion failed (or the
+daemon stopped during the purge), 2 usage error, 3 the daemon cannot be signaled
+(`EPERM`), 5 invalid configuration, 7 `dry_run` is `true`, mount without a
+reachable daemon, or backing directory not accessible.
+
+**Signal.** The daemon purges on `SIGUSR2` whoever sends it:
+
+```sh
+sudo kill -USR2 "$(systemctl show -p MainPID --value tsfs)"
+sudo systemctl kill -s USR2 tsfs@recordings
+```
+
+Only users allowed to signal the daemon (root, or its own user) can request a
+purge, and a purge never deletes a file that the regular collector would keep: it
+only removes the waiting time.
 
 Details: [garbage-collector.md](../architecture/garbage-collector.md).
 
@@ -1367,11 +1553,13 @@ the design is in [logging.md](../architecture/logging.md).
 ## 17. Monitoring
 
 - **Status file** (`metrics.status_file`, default `/run/tsfs/status.json`): JSON
-  document rewritten every `metrics.interval` (default 10 s), on `SIGUSR1`, and at
-  shutdown. It contains the version, pid, uptime, configuration generation and
-  reload counts, garbage collector counters (deleted files and bytes, failures,
-  retries, skips, queue saturations, scans), per-operation FUSE call and error
-  counts, and logging counters.
+  document rewritten every `metrics.interval` (default 10 s), on `SIGUSR1`, when a
+  purge starts or ends, and at shutdown. It contains the version, pid, uptime,
+  configuration generation and reload counts, garbage collector counters (deleted
+  files and bytes, failures, retries, skips, queue saturations, scans, managed
+  files, purges and the result of the last purge), per-operation FUSE call and
+  error counts, the kernel FUSE connection (`fuse`: requests waiting for the
+  daemon), and logging counters.
 - **`tsfs --status`** prints the status file named by the configuration
   (`-c`); exit status 7 when there is none.
 - **`SIGUSR1`** (`sudo kill -USR1 <pid>`) rewrites the status file at once and logs
@@ -1385,6 +1573,112 @@ the design is in [logging.md](../architecture/logging.md).
 The status file is not removed at shutdown: check `pid` and `updated_unix_ms` to
 detect a stopped daemon. Field definitions, counter semantics, alert suggestions and
 a sample health check are in [monitoring.md](monitoring.md).
+
+### Statistics per rule: `tsfs --stats`
+
+`tsfs --stats` scans the backing directory once (directly, without the daemon;
+read access to the whole tree is needed, so root for the service paths) and prints
+one row per rule that decides at least one file, in configuration order (`default`
+for `retention.default`), a `TOTAL` row, and a summary of the other entries:
+
+```text
+TSFS statistics of /var/lib/tsfs/data (2 active rule(s), default retention never)
+RULE                         FILES       SIZE  EXPIRED     <24H  EXCLUDED    NEVER  NEXT EXPIRY (UTC)
+rec                            305       610B      300        5         0        0  2026-10-14T11:51:22Z
+keep                             5        10B        0        0         5        0  -
+TOTAL                          310       620B      300        5         5        0  2026-10-14T11:51:22Z
+directories: 3, symbolic links: 0, other entries: 0, unreadable: 0, mount boundaries: 0
+```
+
+| Column | Meaning |
+|--------|---------|
+| `FILES`, `SIZE` | regular files decided by the rule, and their total size |
+| `EXPIRED` | files already expired now (what `tsfs --purge` would delete, subject to its checks) |
+| `<24H` | files not expired yet that expire within the next 24 hours |
+| `EXCLUDED` | files protected by an `exclude` rule |
+| `NEVER` | files whose retention is `never` |
+| `NEXT EXPIRY (UTC)` | earliest future expiry, `-` when none |
+
+The last line counts the directories, symbolic links and other entries (never
+deleted), the entries that could not be read, and the directories that were not
+entered because they are mount points (with `security.stay_on_filesystem: true`)
+or were swapped for a symbolic link during the scan. The
+report ignores `garbage_collector.dry_run` and `enabled`. For the count seen by the
+daemon itself, `gc.managed_files` in `tsfs --status` gives the regular files of
+its last complete pass.
+
+### Retention of a file: `tsfs-ls` and extended attributes
+
+With `filesystem.retention_xattrs: true` (the default), every regular file of the
+mount has four read-only virtual extended attributes, computed from the current
+policy at each read:
+
+| Attribute | Value |
+|-----------|-------|
+| `user.tsfs.state` | `expires` (expires in the future), `expired` (deletion pending), `excluded` or `never` |
+| `user.tsfs.expires` | expiry in ISO 8601 UTC (`2026-10-14T11:51:22Z`); only when the file expires (absent for `excluded` and `never`) |
+| `user.tsfs.rule` | identifier of the deciding rule, or `default` |
+| `user.tsfs.created` | birth time of the backing file in ISO 8601 UTC (`statx` `btime`), or its modification time when the backing filesystem does not report it |
+
+Read them by name, with `getfattr` (package `attr`) or `getxattr(2)`:
+
+```sh
+getfattr -n user.tsfs.state /mnt/recordings/clip.mp4
+getfattr --only-values -n user.tsfs.expires /mnt/recordings/clip.mp4
+getfattr --only-values -n user.tsfs.created /mnt/recordings/clip.mp4
+```
+
+`getfattr -d` and other tools that list attributes show nothing: `listxattr`
+returns an empty list on purpose, because GNU `ls` (coreutils 9 and later) prints a
+`+` after the mode of every file whose attribute list is not empty, as for an ACL,
+which would mislead every `ls -l` of the mount. Directories, symbolic links,
+special files and the root have no retention attribute (`ENODATA`). The attributes
+cannot be set or removed (`setxattr` and `removexattr` are not supported), and the
+real extended attributes of the backing files are not exposed through the mount.
+
+The `ls` wrapper (installed as the system `ls` by default, see
+[The TSFS ls](#the-tsfs-ls-replacing-the-system-ls)) tags each entry with them on a
+terminal (here with uutils `ls` 0.8.0 as `ls.orig`):
+
+```text
+$ ls -l rec
+total 20
+-rw-r--r-- 1 dev dev    6 Oct 13 12:30 clip.mp4  created 2026-10-13 12:30, filter rec, deleted 2026-10-14 12:30 (in 1d 0h)
+-rw-r--r-- 1 dev dev    2 Oct 13 12:30 hold.keep  UNFILTERED
+-rw-r--r-- 1 dev dev    2 Oct 11 12:30 old.mp4  created 2026-10-13 12:30, filter rec, deletion pending (expired 2026-10-12 12:30)
+-rw-r--r-- 1 dev dev    2 Oct 13 12:30 sp ace.mp4  created 2026-10-13 12:30, filter rec, deleted 2026-10-14 12:30 (in 1d 0h)
+drwxr-xr-x 2 dev dev 4096 Oct 13 12:30 sub  UNFILTERED
+$ ls -R rec
+rec:
+clip.mp4  created 2026-10-13 12:30, filter rec, deleted 2026-10-14 12:30 (in 1d 0h)
+hold.keep  UNFILTERED
+old.mp4  created 2026-10-13 12:30, filter rec, deletion pending (expired 2026-10-12 12:30)
+sp ace.mp4  created 2026-10-13 12:30, filter rec, deleted 2026-10-14 12:30 (in 1d 0h)
+sub  UNFILTERED
+
+rec/sub:
+deep.mp4  created 2026-10-13 12:30, filter rec, deleted 2026-10-14 12:30 (in 1d 0h)
+```
+
+The tags, with dates in local time:
+
+| Tag | Meaning |
+|-----|---------|
+| `created <date>, filter <rule>, deleted <date> (in <remaining>)` | TSFS will delete the file at that date; the remaining time is in days and hours (hours and minutes, minutes, or seconds when shorter) |
+| `created <date>, filter <rule>, deletion pending (expired <date>)` | already expired: the garbage collector will delete it soon |
+| `UNFILTERED` | TSFS will never delete the entry: no expiring rule matches (retention `never` or default `never`), an exclude rule matches, or it is a directory, a symbolic link or a special file |
+
+`created` is the value of `user.tsfs.created`. The deletion date is computed from
+the timestamp of the rule (the modification time by default, the birth time with
+`timestamp: birth`), so `created` can differ from the date the expiry is based on:
+in the example, `old.mp4` was touched to an older modification time, so it shows
+`created` today but is already expired.
+
+Reading the attributes costs one FUSE request each; enabling them also makes the
+kernel send one `getxattr` request before each write. On a write-intensive mount
+of small files where nobody needs the retention tags, set
+`filesystem.retention_xattrs: false` (restart required; see
+[configuration.md](configuration.md)).
 
 ## 18. Performance tuning
 
@@ -1571,6 +1865,8 @@ without a core (see [chapter 19](#19-crash-diagnostics)).
 
 | Symptom | Cause and solution |
 |---------|--------------------|
+| Applications block on the mount | the daemon is slow or hung: `fuse.waiting` in the status file (or `cat /sys/fs/fuse/connections/$(stat -c %d MOUNTPOINT)/waiting`) shows the requests waiting for it. Restart the service; if the daemon cannot be stopped, write to the `abort` file of that directory (see [monitoring](monitoring.md#fuse)) and unmount with `umount -l` |
+| `Transport endpoint is not connected` (`ENOTCONN`) | the daemon died or the connection was aborted while mounted: `sudo umount -l MOUNTPOINT`, then start the service again (and look for a crash report) |
 | `tsfs: '<dir>' is already a mount point (see: findmnt '<dir>')` (exit 7) | another filesystem (often a second TSFS instance with the same `filesystem.mountpoint`) is mounted there; every instance needs its own mount point |
 | `tsfs: cannot access the mount point '<dir>': Permission denied (already a FUSE mount of another user?)` (exit 3) | a FUSE filesystem of another user is mounted there; `findmnt <dir>` as root |
 | `tsfs: /etc/tsfs/config.yml: cannot open configuration file: No such file or directory` (exit 5) | wrong path: pass `-c`, or reinstall to recreate the file from the example |
@@ -1597,8 +1893,19 @@ without a core (see [chapter 19](#19-crash-diagnostics)).
 | A file was deleted unexpectedly | `grep 'path="/the/file"' tsfs.log` shows the `rule=`; check precedence with `tsfs --dry-run`; a rule without scope (`glob`, `extension`) applies to the whole tree |
 | Changes to the file are not applied | look for `config_reload_failed` in the log; restart-only settings (`filesystem`, `diagnostics`, `security`) need a restart; a command-line override (`-m`, `-b`, `-l`) always wins |
 | Permission denied through the mount | `default_permissions` applies normal ownership checks; with `allow_other: false` only the daemon's user can access the mount |
-| `getattr` errors in the status file | normal: lookups of missing files count as errors |
 | Log file deleted by logrotate | TSFS recreates it (`log_file_reopened`); remove the logrotate rule |
+| A large backlog of expired files is deleted slowly | expected with the rate limits (`max_deletions_per_second`, default 100/s); `tsfs --purge` deletes every expired file now |
+| `tsfs: garbage_collector.dry_run is true: a purge would delete nothing...` (exit 7) | set `dry_run: false` and reload to delete; `tsfs --purge --dry-run` previews |
+| `tsfs: <mountpoint> is mounted but its daemon cannot be found through metrics.status_file; refusing an offline purge ...` (exit 7) | pass the daemon's `-c`, enable `metrics`, run as a user who can read the status file, or send `SIGUSR2` to the daemon directly |
+| `tsfs: --purge asks for confirmation on a terminal; use --force in scripts` (exit 2) | standard input is not a terminal: add `--force` |
+| `tsfs: cannot signal the daemon (pid N): Operation not permitted` (exit 3) | run `tsfs --purge` as root or as the daemon's user |
+| `getattr` or `getxattr` errors in the status file | normal: lookups of missing files count as `getattr` errors, and the `security.capability` lookup the kernel makes before each write counts as a `getxattr` error |
+| `ls` shows no retention tags | output not a terminal (use `TSFS_LS=always`), `TSFS_LS=off`, `--help`, `--version`, `--zero`, `--dired` or `-D` given, no operand in a TSFS mount, an original `ls` without `--dired` support (its output is then shown unchanged), or `/usr/bin/ls` is the system `ls` again after a coreutils upgrade (`sudo cmake --install` re-applies the wrapper) |
+| every entry is tagged `RETENTION UNKNOWN (filesystem.retention_xattrs is false)` | the daemon serves no retention attribute: set `filesystem.retention_xattrs: true` and restart it |
+| every entry of a TSFS listing is tagged `UNFILTERED` | no expiring rule matches these files (`retention.default: never` and no rule) |
+| `ls` shows no colors in a TSFS mount | expected: the original `ls` writes to a pipe there; `TSFS_LS=off ls --color=auto` or `ls.orig` show them, without tags |
+| `ls: the original ls cannot be found (/usr/bin/ls.orig missing; set TSFS_REAL_LS)` | `sudo apt install --reinstall coreutils` restores the system `ls` (the next `sudo cmake --install` renames it `ls.orig` again); until then, `TSFS_REAL_LS=/path/to/ls` |
+| `dpkg --verify coreutils` reports `/usr/bin/ls` | expected while the wrapper is in place; build with `-DTSFS_REPLACE_SYSTEM_LS=OFF` to avoid it |
 
 For deeper investigation, run in the foreground with debug logging:
 
@@ -1611,7 +1918,7 @@ Exit statuses: 0 success; 1 runtime error; 2 usage error; 3 insufficient
 privileges (`/dev/fuse` not accessible, `allow_other` refused); 4 missing
 dependency (`/dev/fuse` missing, `openat2` required but unavailable); 5 invalid
 or untrusted configuration (file or command line); 7 unexpected system state
-(missing directory, mount failure, missing status file).
+(missing directory, mount failure, missing status file, purge refused).
 
 ## 22. Uninstallation
 
@@ -1633,6 +1940,18 @@ or untrusted configuration (file or command line); 7 unexpected system state
    (written by `cmake --install`). It removes only regular files and symbolic links,
    never directories (except the TSFS documentation directory when it ends up
    empty), and reports missing files without failing.
+
+   It also puts the system `ls` back (never with `DESTDIR`):
+
+   - `/usr/bin/ls` is the wrapper and `/usr/bin/ls.orig` exists: `ls.orig` is
+     renamed back to `/usr/bin/ls` (`Restored the system ls`), identical to the
+     original (a symbolic link, such as the uutils one, keeps its target);
+   - `/usr/bin/ls` is the wrapper but `ls.orig` is missing: a warning asks to run
+     `sudo apt install --reinstall coreutils`;
+   - `/usr/bin/ls` is already the system `ls` (a coreutils upgrade replaced the
+     wrapper) and `ls.orig` exists: the stale `ls.orig` is removed.
+
+   Check with `dpkg --verify coreutils` (no output for `/usr/bin/ls`).
 
 3. What is **kept**: `/etc/tsfs/config.yml`, the backing directory and all managed
    data, the logs (`/var/log/tsfs`), crash reports, `/var/lib/tsfs` and the status
@@ -1684,6 +2003,19 @@ configuration is kept), then run the `uninstall` target.
   `RestrictAddressFamilies=AF_UNIX`, `UMask=0027` (which does not alter the modes of
   files created through the mount: the daemon resets its umask to 0). It does not
   use mount-namespace sandboxing, which would hide the FUSE mount.
+- **Purges.** `tsfs --purge` and `SIGUSR2` need the right to signal the daemon
+  (root or the daemon's user) and only remove files that are already expired under
+  the policy; protect the configuration as above, since it is what defines
+  "expired". Prefer the daemon purge to an offline one.
+- **Retention attributes disclose part of the policy.** Any user who can read a
+  file through the mount (the usual kernel permission checks apply) can read its
+  expiry, its creation time and the identifier of its rule. If
+  rule names or expiries are sensitive, name rules neutrally or set
+  `filesystem.retention_xattrs: false`.
+- **The `ls` replacement** renames a file of the `coreutils` package
+  (`/usr/bin/ls` becomes `/usr/bin/ls.orig`). Build with
+  `-DTSFS_REPLACE_SYSTEM_LS=OFF` on systems where package integrity checks matter
+  or where a non-standard `ls` is not acceptable.
 - **Monitor** `config_reload_failed`, `gc_delete_failed` and
   `gc_file_skipped reason="unsafe"`: the last one indicates that something swapped
   a directory for a symbolic link or mounted a filesystem inside the tree.
@@ -1694,9 +2026,24 @@ The threat model, attack surfaces and mitigations are described in
 ## 24. Known limitations
 
 - **Passthrough only.** `filesystem.mode` accepts only `passthrough`.
-- **Unsupported operations.** Extended attributes, `ioctl` and `poll` are not
-  supported (`ENOSYS`); `copy_file_range` falls back to read/write in the kernel.
-  File locks are handled locally by the kernel.
+- **Unsupported operations.** `ioctl` and `poll` are not supported (`ENOSYS`);
+  `copy_file_range` falls back to read/write in the kernel. File locks are handled
+  locally by the kernel.
+- **Extended attributes.** Only the four read-only `user.tsfs.*` retention
+  attributes are served, and they are not listed by `listxattr`; the real extended
+  attributes of the backing files (including ACLs and security labels) are not
+  exposed, and setting or removing attributes is not supported. With
+  `retention_xattrs: false`, no attribute is served at all.
+- **TSFS listings of the `ls` wrapper.** Colors are not shown in TSFS listings
+  (the original `ls` writes to a pipe), and formats other than the long ones
+  (columns, `-x`, `-m`, ...) become one entry per line followed by its tag; when an
+  option overrides the long format so that the original `ls` prints no dired
+  trailer, the listing is shown without tags. Outside TSFS mounts and when the
+  output is not a terminal, `ls` is unchanged. A coreutils upgrade puts the system
+  `ls` back over the wrapper until TSFS is installed again.
+- **Purge.** Without a reachable daemon, `tsfs --purge` refuses to purge a mounted
+  mount point. A purge runs at most 1000 complete passes, each limited to
+  `max_pending_tasks` expired files; a larger backlog needs a second purge.
 - **Only regular files expire.** Directories, including empty ones, symbolic links
   and special files are never deleted.
 - **Open-file protection covers the mount only.** `skip_open_files` knows only the

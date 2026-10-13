@@ -171,7 +171,8 @@ TEST_F(ReloadTest, ConcurrentReloadsAndReaders) {
 TEST_F(ReloadTest, InotifyDetectsAtomicReplacementAndIgnoresNoOps) {
     ConfigManager manager(path_.string(), {}, log_);
     ASSERT_TRUE(manager.load_initial().has_value());
-    auto watcher = ConfigWatcher::create(path_.string(), {[&](std::string_view t) { (void)manager.reload(t); }, {}});
+    auto watcher =
+        ConfigWatcher::create(path_.string(), {[&](std::string_view t) { (void)manager.reload(t); }, {}, {}});
     ASSERT_TRUE(watcher.has_value());
     ASSERT_TRUE((*watcher)->inotify_active());
     (*watcher)->start();
@@ -190,15 +191,19 @@ TEST_F(ReloadTest, SighupBridgeAlwaysReloads) {
     ConfigManager manager(path_.string(), {}, log_);
     ASSERT_TRUE(manager.load_initial().has_value());
     std::atomic<int> status_calls{0};
-    auto watcher = ConfigWatcher::create(
-        path_.string(), {[&](std::string_view t) { (void)manager.reload(t); }, [&] { status_calls.fetch_add(1); }});
+    std::atomic<int> purge_calls{0};
+    auto watcher =
+        ConfigWatcher::create(path_.string(), {[&](std::string_view t) { (void)manager.reload(t); },
+                                               [&] { status_calls.fetch_add(1); }, [&] { purge_calls.fetch_add(1); }});
     ASSERT_TRUE(watcher.has_value());
     (*watcher)->start();
-    install_control_signal_handlers((*watcher)->reload_fd(), (*watcher)->status_fd());
+    install_control_signal_handlers((*watcher)->reload_fd(), (*watcher)->status_fd(), (*watcher)->purge_fd());
     ::raise(SIGHUP);  // Unchanged file: SIGHUP still reloads.
     EXPECT_TRUE(eventually([&] { return manager.current()->generation == 2; }));
     ::raise(SIGUSR1);
     EXPECT_TRUE(eventually([&] { return status_calls.load() == 1; }));
+    ::raise(SIGUSR2);  // tsfs --purge
+    EXPECT_TRUE(eventually([&] { return purge_calls.load() == 1; }));
     install_control_signal_handlers(-1, -1);
     (*watcher)->stop();
 }
@@ -210,7 +215,7 @@ TEST_F(ReloadTest, WatchIsReestablishedWhenTheDirectoryIsRecreated) {
     test::write_file(cfg, document("1d"));
     ConfigManager manager(cfg.string(), {}, log_);
     ASSERT_TRUE(manager.load_initial().has_value());
-    auto watcher = ConfigWatcher::create(cfg.string(), {[&](std::string_view t) { (void)manager.reload(t); }, {}});
+    auto watcher = ConfigWatcher::create(cfg.string(), {[&](std::string_view t) { (void)manager.reload(t); }, {}, {}});
     ASSERT_TRUE(watcher.has_value());
     (*watcher)->start();
     fs::remove_all(sub);

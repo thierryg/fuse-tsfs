@@ -38,7 +38,8 @@ Result<std::unique_ptr<FuseSession>> FuseSession::mount(const Options& options, 
         argv.push_back(arg.data());
     }
     fuse_args args = FUSE_ARGS_INIT(static_cast<int>(argv.size()), argv.data());
-    session->fuse_ = fuse_new(&args, &PassthroughFs::operations(), sizeof(fuse_operations), &fs);
+    session->fuse_ =
+        fuse_new(&args, &PassthroughFs::operations(options.retention_xattrs), sizeof(fuse_operations), &fs);
     fuse_opt_free_args(&args);
     if (session->fuse_ == nullptr) {
         return make_error(EINVAL, "fuse_new failed (invalid mount options, see the message above)");

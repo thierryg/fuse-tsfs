@@ -357,6 +357,9 @@ local quality gate `scripts/tsfs-qa.sh` (steps `format` and `tidy`, see
 
   ```bash
   scripts/tsfs-dev.sh scripts/tsfs-qa.sh tidy        # run-clang-tidy with build/clang
+  # The tidy step only configures build/clang (--fresh) and reads its
+  # compile_commands.json: CMAKE_CXX_SCAN_FOR_MODULES is OFF, so the database holds no
+  # "@<file>.modmap" arguments that would only exist after a build.
   # or during compilation:
   scripts/tsfs-dev.sh cmake -S . -B build/tidy -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_CXX_COMPILER=clang++ -DTSFS_ENABLE_CLANG_TIDY=ON

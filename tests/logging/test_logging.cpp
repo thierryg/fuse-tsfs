@@ -199,8 +199,13 @@ TEST_F(LoggingTest, DiscardNewPolicyCountsAndReportsLosses) {
             });
         }
     }
+    // Let the worker drain the queue before flushing: with discard_new, a flush
+    // request posted while the queue is still full is itself discarded and counted.
+    const auto accounted = [&] { return test::count_lines(active()) + log_.stats().queue_overruns == 160000U; };
+    for (int i = 0; i < 1000 && !accounted(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
     log_.flush();
-    std::this_thread::sleep_for(100ms);
     const auto dropped = log_.stats().queue_overruns;
     EXPECT_GT(dropped, 0U);
     log_.maintenance();

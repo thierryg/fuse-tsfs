@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -96,6 +97,54 @@ protected:
     std::mutex invalidated_mutex_;
     std::vector<std::string> invalidated_;
 };
+
+/// tsfs --purge / SIGUSR2: every expired file at once, rate limit and cycle budget
+/// ignored, exclusions and young files kept, and the scheduler bound does not leave
+/// files behind (several passes).
+TEST_F(GcTest, PurgeDeletesEveryExpiredFileAtOnce) {
+    for (int i = 0; i < 300; ++i) {
+        file(std::format("old/f{}", i), 2h);
+    }
+    const auto young = file("young", 10min);
+    const auto kept = file("old/x.keep", 2h);
+    RetentionConfig retention = everything(1h);
+    auto keep = test::rule("keep", std::nullopt);
+    keep.action = RuleAction::exclude;
+    keep.glob = "*.keep";
+    retention.rules.push_back(keep);
+    GcConfig gc_config = fast_config();
+    gc_config.scan_interval = 1h;            // No periodic pass during the test.
+    gc_config.max_deletions_per_second = 1;  // Would take 5 minutes without the purge.
+    gc_config.max_deletions_per_cycle = 10;
+    gc_config.max_pending_tasks = 64;  // Fewer slots than expired files: several passes.
+    auto gc = make(retention, gc_config);
+    gc->start();
+    ASSERT_TRUE(eventually([&] { return gc->stats().scans_completed >= 1; }));
+    gc->request_purge();
+    ASSERT_TRUE(eventually([&] { return gc->stats().purges_completed == 1; }, 30s));
+    const GcStats s = gc->stats();
+    EXPECT_EQ(s.purging, 0U);
+    EXPECT_EQ(s.last_purge_failed, 0U);
+    EXPECT_GE(s.last_purge_deleted + 2U, 300U);  // At most a token or two spent before the purge.
+    EXPECT_EQ(s.deleted, 300U);
+    EXPECT_TRUE(fs::exists(young));
+    EXPECT_TRUE(fs::exists(kept));
+    gc->stop();
+}
+
+TEST_F(GcTest, PurgeWorksWithTheGcDisabledAndHonorsDryRun) {
+    const auto old_file = file("old", 2h);
+    GcConfig gc_config = fast_config();
+    gc_config.enabled = false;
+    gc_config.dry_run = true;
+    auto gc = make(everything(1h), gc_config);
+    gc->start();
+    gc->request_purge();
+    ASSERT_TRUE(eventually([&] { return gc->stats().purges_completed == 1; }));
+    EXPECT_TRUE(fs::exists(old_file));        // dry_run: nothing deleted...
+    EXPECT_EQ(gc->stats().would_delete, 1U);  // ...but the file was examined.
+    gc->stop();
+}
 
 TEST_F(GcTest, EmptyStorage) {
     auto gc = make(everything());

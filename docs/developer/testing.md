@@ -46,16 +46,16 @@ on purpose so that the diagnostics tests never crash the test runner.
 
 `tsfs_add_test` escapes the list separators of `LABELS` and `ENVIRONMENT` before passing
 them to `gtest_discover_tests` (which flattens its `PROPERTIES`), so every declared label
-and every environment variable is applied to every test case. CTest discovers 196 test
+and every environment variable is applied to every test case. CTest discovers 206 test
 cases; per label:
 
 | Label | Tests | Label | Tests |
 |---|---|---|---|
-| `unit` | 91 | `logging` | 20 |
-| `concurrency` | 101 | `filesystem` | 21 |
-| `security` | 63 | `reload` | 10 |
-| `gc` | 50 | `diagnostics` | 10 |
-| `config` | 33 | `stress` | 2 |
+| `unit` | 94 | `logging` | 20 |
+| `concurrency` | 108 | `filesystem` | 26 |
+| `security` | 70 | `reload` | 10 |
+| `gc` | 52 | `diagnostics` | 10 |
+| `config` | 34 | `stress` | 2 |
 | `policy` | 27 | | |
 
 Parameterized suites count once per instantiation: `tsfs_scheduler_tests` has 22 cases
@@ -133,7 +133,10 @@ binary. `fuse_available()` skips them with a reason when:
 
 `scripts/tsfs-dev.sh` grants `/dev/fuse`, `CAP_SYS_ADMIN` and an unconfined AppArmor
 profile by default, so the FUSE tests run inside the container; `--no-fuse` removes them,
-and the tests then skip. A test that fails while mounting can leave a stale mount point:
+and the tests then skip. `MountTest.TsfsLsShowsRetentionOnATerminalAndDelegatesOtherwise`
+additionally needs `script(1)` (util-linux) to give `tsfs-ls` a terminal, and skips
+without it. `tsfs_filesystem_tests` depends on the `tsfs` and `tsfs_ls` targets.
+A test that fails while mounting can leave a stale mount point:
 see [debugging.md](debugging.md#7-common-failure-modes).
 
 Every `MountTest` ends (`TearDown`) by stopping the daemon and checking that it **exited

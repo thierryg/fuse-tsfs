@@ -91,6 +91,7 @@ std::vector<std::string> ConfigManager::keep_static_settings(Config& next, const
     keep(next.filesystem.backing_directory, running.filesystem.backing_directory, "filesystem.backing_directory");
     keep(next.filesystem.allow_other, running.filesystem.allow_other, "filesystem.allow_other");
     keep(next.filesystem.read_only, running.filesystem.read_only, "filesystem.read_only");
+    keep(next.filesystem.retention_xattrs, running.filesystem.retention_xattrs, "filesystem.retention_xattrs");
     keep(next.diagnostics.enabled, running.diagnostics.enabled, "diagnostics.enabled");
     keep(next.diagnostics.text_stack_trace, running.diagnostics.text_stack_trace, "diagnostics.text_stack_trace");
     keep(next.diagnostics.native_core_dump, running.diagnostics.native_core_dump, "diagnostics.native_core_dump");

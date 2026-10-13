@@ -43,6 +43,7 @@ function(tsfs_add_test name)
     target_compile_definitions(${name} PRIVATE
         TSFS_BINARY="$<TARGET_FILE:tsfs>"
         TSFS_CRASH_HELPER="$<TARGET_FILE:tsfs_crash_helper>"
+        TSFS_LS_BINARY="$<TARGET_FILE:tsfs_ls>"
         TSFS_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     # gtest_discover_tests flattens PROPERTIES: list values (several labels, several
     # environment variables) must have their separators escaped, or only the first
@@ -78,7 +79,7 @@ add_dependencies(tsfs_diagnostics_tests tsfs_crash_helper)
 tsfs_add_test(tsfs_security_tests LABELS "security" SOURCES security/test_backing_store.cpp)
 tsfs_add_test(tsfs_filesystem_tests LABELS "filesystem;security;concurrency" SOURCES filesystem/test_mount.cpp
               TIMEOUT 300)
-add_dependencies(tsfs_filesystem_tests tsfs)
+add_dependencies(tsfs_filesystem_tests tsfs tsfs_ls)
 tsfs_add_test(tsfs_stress_tests LABELS stress SOURCES stress/test_stress.cpp TIMEOUT 600)
 
 # "tests": build every test binary (and the daemon), then run CTest.

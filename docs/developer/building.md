@@ -53,8 +53,11 @@ fetched.
 Older distributions (Ubuntu 22.04 and 24.04 in particular) ship no C++26 toolchain. The
 supported way to build on such a host is the development image `tsfs-dev:26.04`, defined
 by [`docker/Dockerfile.dev`](../../docker/Dockerfile.dev) (Ubuntu 26.04: GCC 15 and 16,
-Clang 21, libfuse 3.18, lcov 2.0, Doxygen, gdb, cppcheck, shellcheck; every package comes
-from the Ubuntu archive). Nothing is installed on the host.
+Clang 21 with its sanitizer runtimes (`libclang-rt-dev`, needed by the `clang` preset,
+which is a Debug build and therefore uses ASan + UBSan), libfuse 3.18, lcov 2.0, Doxygen,
+gdb, cppcheck, shellcheck, `script(1)` from util-linux; every package comes from the
+Ubuntu archive). An image built before `libclang-rt-dev` was added fails to link the
+`clang` tree: rebuild it with `scripts/tsfs-dev.sh --rebuild true`. Nothing is installed on the host.
 
 ```bash
 scripts/tsfs-dev.sh [--rebuild] [--no-fuse] [--no-aslr] [--] [COMMAND [ARG...]]
@@ -106,6 +109,10 @@ scripts/tsfs-dev.sh cmake --build --preset release
 
 All configure presets inherit a hidden `base` preset: generator **Ninja**,
 `binaryDir = build/<preset>`, `CMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+`CMakeLists.txt` also sets `CMAKE_CXX_SCAN_FOR_MODULES OFF`: TSFS uses no C++20 modules,
+and without dependency scanning `compile_commands.json` contains no `@<file>.modmap`
+arguments, which only exist after a build and made clang-tidy fail on a configured-only
+tree.
 
 ```bash
 cmake --list-presets          # configure presets
@@ -149,7 +156,7 @@ ctest --preset debug -L gc                    # or run a subset through CTest
 | Target | Defined in | Purpose | Output |
 |---|---|---|---|
 | `deps` | `CMakeLists.txt`, `CMake/CheckDeps.cmake` | Report every dependency per profile; fail when one required by `TSFS_DEPS_PROFILES` is missing | Console report with the `apt install` line |
-| `build` | `CMakeLists.txt` | Every artifact of the tree: daemon, test binaries, crash helper, benchmarks | `src/tsfs`, `tests/*`, `benchmarks/*` |
+| `build` | `CMakeLists.txt` | Every artifact of the tree: daemon, `tsfs-ls`, test binaries, crash helper, benchmarks | `src/tsfs`, `src/tsfs-ls`, `tests/*`, `benchmarks/*` |
 | (default `all`) | CMake | Same set as `build` (`cmake --build <tree>`) | |
 | `tests` | `tests/CMakeLists.txt` | Build the daemon and every test binary, then run CTest (`-j 4`, output on failure, JUnit) | `<tree>/test-results.xml`, `<tree>/test-artifacts/` |
 | `coverage` | `CMake/Coverage.cmake` (coverage trees only) | lcov capture, filter to `src/`, genhtml, summary | `<tree>/coverage/{html/,summary.json,uncovered.txt,tsfs.info}` |
@@ -157,7 +164,7 @@ ctest --preset debug -L gc                    # or run a subset through CTest
 | `doc` | `CMake/Documentation.cmake` | Doxygen HTML of `src/`, `README.md` and `docs/**/*.md` | `<tree>/docs/html/index.html`, `<tree>/docs/doxygen-warnings.log` |
 | `bench` | `benchmarks/CMakeLists.txt` (when Google Benchmark is found) | Run the four Google Benchmark binaries | `<tree>/bench-results/*.json` |
 | `install` | CMake (rules in `CMake/Packaging.cmake`) | Standard install step (prefer `cmake --install`) | Files under `CMAKE_INSTALL_PREFIX` |
-| `uninstall` | `CMake/Packaging.cmake`, `CMake/Uninstall.cmake` | Remove exactly the files listed in `<tree>/install_manifest.txt` | |
+| `uninstall` | `CMake/Packaging.cmake`, `CMake/Uninstall.cmake` | Remove exactly the files listed in `<tree>/install_manifest.txt`, and restore the system `ls` replaced by `tsfs-ls` | |
 
 Each target can be listed from a configured tree:
 
@@ -314,15 +321,20 @@ scripts/tsfs-qa.sh -h                                         # usage
 | `doc` | Doxygen HTML (release tree) |
 
 Default: every step, in this order. Option `-j N` sets the build and test parallelism
-(default `nproc`). Each step runs in its own process: a failing step does not stop the
+(default `nproc`). Every step configures its tree with `cmake --preset <name> --fresh`:
+the cache is rebuilt from the current defaults, so a stale local cache cannot hide a
+difference with a clean CI checkout. Each step runs in its own process: a failing step does not stop the
 following ones, and the script ends with the list of failed steps. Exit codes: 0 every
 step passed, 1 a step failed, 2 usage error, 4 missing tool.
 
 The optional GitHub Actions workflow [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
 runs exactly the same thing: one matrix job per step, each building the development image
-and calling `scripts/tsfs-dev.sh --no-aslr scripts/tsfs-qa.sh <step>`. It uploads the
-coverage report and the Doxygen HTML as artifacts. On a runner without `/dev/fuse`, the
-FUSE tests are reported as skipped.
+and calling `scripts/tsfs-dev.sh --no-aslr scripts/tsfs-qa.sh <step>` (with
+`actions/checkout@v5` and `actions/upload-artifact@v5`). It uploads the coverage report
+and the Doxygen HTML as artifacts and, when a job fails, its test logs
+(`build/*/Testing/Temporary/LastTest*.log` and `build/*/test-artifacts/`, artifact
+`test-logs-<step>`). On a runner without `/dev/fuse`, the FUSE tests are reported as
+skipped.
 
 ## 5. Build options
 
@@ -338,6 +350,8 @@ FUSE tests are reported as skipped.
 | `TSFS_DEPS_PROFILES` | `build;test` | Profiles checked by `deps`: `build`, `test`, `doc`, `coverage`, `bench`, `diagnostics`, `qa` |
 | `TSFS_SYSTEMD_UNIT_DIR` | empty | Destination of `tsfs.service`; empty means systemd's `systemdsystemunitdir` from pkg-config, else `<prefix>/lib/systemd/system` |
 | `TSFS_TEST_ARTIFACT_DIR` | `<tree>/test-artifacts` | Where CTest-run tests create their temporary trees (see [testing.md](testing.md)) |
+| `TSFS_REPLACE_SYSTEM_LS` | `ON` | At installation (root, no `DESTDIR` only), rename the system `ls` to `<TSFS_SYSTEM_LS>.orig` and install the `tsfs-ls` wrapper as `<TSFS_SYSTEM_LS>`; `uninstall` renames `.orig` back. `OFF`: `tsfs-ls` is installed under its own name only |
+| `TSFS_SYSTEM_LS` | `/usr/bin/ls` | The system `ls` that `tsfs-ls` wraps; also compiled into `tsfs-ls` to find the original (`<TSFS_SYSTEM_LS>.orig`) |
 
 Standard CMake variables also apply: `CMAKE_BUILD_TYPE` (`Debug`, `Release`,
 `RelWithDebInfo`; `Release` when unset with a single-configuration generator),
@@ -382,14 +396,28 @@ Install rules (`CMake/Packaging.cmake`), relative to `CMAKE_INSTALL_PREFIX`:
 | Path | Content |
 |---|---|
 | `bin/tsfs` | Daemon and command-line interface |
-| `share/man/man1/tsfs.1` | Manual page |
+| `bin/tsfs-ls` | `ls` wrapper tagging the retention of each entry of a TSFS mount (standalone executable, target `tsfs_ls`) |
+| `share/man/man1/tsfs.1`, `tsfs-ls.1` | Manual pages |
 | `share/doc/tsfs/` | `README.md`, `CHANGELOG.md`, `LICENSE`, `SECURITY.md`, `docs/user/`, `docs/security/` |
 | `share/doc/tsfs/examples/config.example.yml` | Commented example configuration |
-| `<TSFS_SYSTEMD_UNIT_DIR>/tsfs.service` | systemd unit, installed **disabled** |
+| `<TSFS_SYSTEMD_UNIT_DIR>/tsfs.service`, `tsfs@.service` | systemd units, installed **disabled** |
 | `<dir of TSFS_DEFAULT_CONFIG_PATH>/config.yml` | Created from the example **only if absent** (mode 0640); never overwritten |
 
 The active configuration is created by an `install(CODE)` step, outside the install
-manifest, so `uninstall` never removes it. No data, log or state directory is created:
+manifest, so `uninstall` never removes it.
+
+With `TSFS_REPLACE_SYSTEM_LS=ON` (default), a second `install(CODE)` step wraps the
+system `ls`, only when the installation runs as root (`id -u` is 0) and `DESTDIR` is
+empty (staged and package installations never touch it). If `<TSFS_SYSTEM_LS>` is a
+symbolic link or does not contain the marker `TSFS-LS-WRAPPER`, it is the system `ls`:
+it is renamed (`file(RENAME)`, no copy) to `<TSFS_SYSTEM_LS>.orig`, replacing a stale
+`.orig` left by a coreutils reinstallation; a symbolic link (uutils coreutils on
+Ubuntu 26.04) is renamed as is. If it is already the wrapper, only the wrapper is
+refreshed, unless `.orig` is missing: then the installation fails (`FATAL_ERROR`)
+asking for `apt install --reinstall coreutils`. Finally `bin/tsfs-ls` is copied to
+`<TSFS_SYSTEM_LS>.tsfs-new` (mode 0755) and renamed over `<TSFS_SYSTEM_LS>`. Neither file
+is in the install manifest. See the user guide ("The TSFS ls replacing the system ls")
+for the behavior of the wrapper and the risks. No data, log or state directory is created:
 systemd creates `/var/lib/tsfs` and `/var/log/tsfs` (`StateDirectory=`, `LogsDirectory=`).
 
 Root is only needed for the installation step into system directories; build as a normal
@@ -435,7 +463,12 @@ DESTDIR="$PWD/build/stage" cmake --build build/release --target uninstall   # st
   directory are never in the manifest and are kept;
 - directories are not removed, except the TSFS documentation directory when it ends up
   empty;
-- a missing file is reported and skipped (the target is idempotent).
+- a missing file is reported and skipped (the target is idempotent);
+- unless `DESTDIR` is set, the system `ls` is restored (`-DSYSTEM_LS=<TSFS_SYSTEM_LS>`):
+  if it is the wrapper and `<TSFS_SYSTEM_LS>.orig` exists (file or symbolic link),
+  `.orig` is renamed back; if it is the wrapper without `.orig`, a warning gives the
+  `apt install --reinstall coreutils` command; if it is already the system `ls` and
+  `.orig` remains, the stale `.orig` is removed.
 
 Use the same privileges as for the installation. If the service was enabled, run
 `systemctl disable --now tsfs.service && systemctl daemon-reload` as well.

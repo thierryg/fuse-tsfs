@@ -218,8 +218,38 @@ Observations:
   `entry_timeout`/`attr_timeout` (fewer lookups), `writeback_cache`, kernel FUSE
   passthrough for open files (Linux >= 6.9, libfuse >= 3.17), batching
   notifications. Each must be justified by a measurement first.
+- These numbers predate the retention extended attributes: TSFS 0.1.0 had no
+  `getxattr` callback. With `filesystem.retention_xattrs: true` (now the default),
+  small-file writes are slower; see section 8.
 
-## 8. Summary
+## 8. Retention extended attributes: cost
+
+Once a filesystem implements `getxattr`, the kernel sends one `getxattr` request
+(`security.capability`, looked up before a write) to the daemon for each write
+request. TSFS answers it with `ENODATA` without touching the disk, but the FUSE
+round trip remains. Counted in the status file of the mount after the workload:
+10,256 `write` requests and 10,256 `getxattr` requests (all of them errors, as
+expected).
+`filesystem.retention_xattrs: false` removes the `getxattr` and `listxattr`
+callbacks: the kernel gets `ENOSYS` once and stops asking.
+
+A/B measurement on the machine of section 1, same session, Release build,
+`tsfs_fs_workload` with 10,000 files, 3 runs per variant, medians (range in
+parentheses):
+
+| Operation | `retention_xattrs: true` | `retention_xattrs: false` | Change |
+|---|---|---|---|
+| create + 4 KiB write + close | 7.1 k/s (6.0-8.5 k) | 9.8 k/s (8.7-13.1 k) | about -28 % |
+| sequential write, 1 MiB requests | no difference beyond noise | | |
+| concurrent create | no difference beyond noise | | |
+
+The ranges overlap (the machine was loaded, see section 1), so -28 % is an estimate
+of the median effect on small writes, not a precise figure. Large writes are not
+affected measurably: one extra request per 1 MiB write is small next to the data
+transfer. Disable the attributes on write-intensive mounts of small files where
+nobody needs them (`tsfs-ls` then tags every entry `UNFILTERED`).
+
+## 9. Summary
 
 | Question | Answer from the measurements |
 |---|---|
@@ -230,6 +260,7 @@ Observations:
 | Deletion speed | ~60-74 k files/s single-threaded, revalidation included. |
 | Do more workers help? | Not on a local SSD with clustered directories: 1 worker was fastest. |
 | FUSE overhead | 3x-17x depending on the operation (see section 7). |
+| Cost of the retention attributes | About -28 % (median) on small-file create + write; none measurable on large writes and concurrent creates (section 8). |
 
 Re-run the commands of section 2 on the target hardware before relying on any of
 these values; compare variants within one run.

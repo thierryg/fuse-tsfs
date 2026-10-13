@@ -62,6 +62,27 @@ foreach(_f IN LISTS _files)
     endif()
 endforeach()
 
+# The system ls: rename <ls>.orig back to <ls> if the wrapper is in place (never with
+# DESTDIR).
+if(SYSTEM_LS AND "$ENV{DESTDIR}" STREQUAL "")
+    set(_orig "${SYSTEM_LS}.orig")
+    set(_ours "")
+    if(EXISTS "${SYSTEM_LS}" AND NOT IS_SYMLINK "${SYSTEM_LS}")
+        file(STRINGS "${SYSTEM_LS}" _ours REGEX "TSFS-LS-WRAPPER" LIMIT_COUNT 1)
+    endif()
+    if(_ours AND (EXISTS "${_orig}" OR IS_SYMLINK "${_orig}"))
+        file(RENAME "${_orig}" "${SYSTEM_LS}")
+        message(STATUS "Restored the system ls: ${_orig} -> ${SYSTEM_LS}")
+    elseif(_ours)
+        message(WARNING "uninstall: ${SYSTEM_LS} is still the TSFS wrapper and ${_orig} is missing: "
+                        "restore it with 'apt install --reinstall coreutils'")
+    elseif(EXISTS "${_orig}" OR IS_SYMLINK "${_orig}")
+        # coreutils reinstalled the system ls over the wrapper meanwhile: ls.orig is stale.
+        file(REMOVE "${_orig}")
+        message(STATUS "${SYSTEM_LS} is already the system ls; removed the stale ${_orig}")
+    endif()
+endif()
+
 # Remove the (now empty) documentation tree of TSFS, deepest directories first.
 list(REMOVE_DUPLICATES _doc_dirs)
 foreach(_doc IN LISTS _doc_dirs)

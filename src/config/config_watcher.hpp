@@ -34,7 +34,7 @@ namespace tsfs {
  *   is compared with the last loaded content, so unrelated files in the directory
  *   and no-op saves do not cause reloads. If the directory itself disappears, the
  *   watch is re-established every 2 s.
- * - reload_fd()/status_fd() are eventfds written by the SIGHUP/SIGUSR1 handlers
+ * - reload_fd()/status_fd()/purge_fd() are eventfds written by the SIGHUP/SIGUSR1/SIGUSR2 handlers
  *   (write(2) is async-signal-safe); SIGHUP always reloads, even if unchanged.
  * Callbacks run on the watcher thread, one at a time.
  */
@@ -43,6 +43,7 @@ public:
     struct Callbacks {
         std::function<void(std::string_view trigger)> reload;
         std::function<void()> dump_status;
+        std::function<void()> purge;  ///< SIGUSR2 (tsfs --purge); may be empty.
     };
 
     /// Create the descriptors (inotify may be unavailable: then only signals work).
@@ -58,6 +59,7 @@ public:
 
     [[nodiscard]] int reload_fd() const noexcept { return reload_fd_.get(); }
     [[nodiscard]] int status_fd() const noexcept { return status_fd_.get(); }
+    [[nodiscard]] int purge_fd() const noexcept { return purge_fd_.get(); }
     [[nodiscard]] bool inotify_active() const noexcept { return watch_.load(std::memory_order_relaxed) >= 0; }
 
 private:
@@ -72,6 +74,7 @@ private:
     UniqueFd inotify_;
     UniqueFd reload_fd_;
     UniqueFd status_fd_;
+    UniqueFd purge_fd_;
     UniqueFd stop_fd_;
     std::atomic<int> watch_{-1};  ///< Written by the watcher thread, read by inotify_active().
     std::uint64_t last_hash_{0};
@@ -79,11 +82,12 @@ private:
 };
 
 /**
- * @brief Install SIGHUP -> write(@p reload_fd) and SIGUSR1 -> write(@p status_fd).
+ * @brief Install SIGHUP -> write(@p reload_fd), SIGUSR1 -> write(@p status_fd) and
+ *        SIGUSR2 -> write(@p purge_fd) (default disposition when -1).
  *
  * Process-wide (signal dispositions are global). The handlers only perform
  * write(2) on an eventfd. Pass -1 to restore the default dispositions.
  */
-void install_control_signal_handlers(int reload_fd, int status_fd) noexcept;
+void install_control_signal_handlers(int reload_fd, int status_fd, int purge_fd = -1) noexcept;
 
 }  // namespace tsfs

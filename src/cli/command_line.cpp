@@ -46,6 +46,9 @@ enum LongOnly : int {
     kNoStackTrace,
     kCoreDump,
     kNoCoreDump,
+    kPurge,
+    kForce,
+    kStats,
 };
 
 const char* action_name(CliAction action) {
@@ -55,6 +58,8 @@ const char* action_name(CliAction action) {
         case CliAction::show_config: return "--show-config";
         case CliAction::dry_run: return "--dry-run";
         case CliAction::status: return "--status";
+        case CliAction::purge: return "--purge";
+        case CliAction::stats: return "--stats";
         case CliAction::print_example_config: return "--print-example-config";
         case CliAction::version: return "--version";
         case CliAction::help: return "--help";
@@ -81,6 +86,13 @@ Actions (at most one; default: mount and run):
                              deleted now (same checks as the real GC, except files open
                              through a running mount, unknown here), delete nothing, exit
       --status               print the status file of the running daemon (metrics.status_file)
+      --stats                scan the backing directory once and print, per rule, the number
+                             of files and bytes, expired, expiring within 24 h, excluded, never
+      --purge                delete now every file that is already expired (rate limits
+                             ignored, same checks as the GC; excluded and "never" files are
+                             kept); done by the running daemon (SIGUSR2) or, when none runs,
+                             by this process. Asks for confirmation; with --dry-run: only list
+      --force                with --purge: do not ask for confirmation (scripts)
       --print-example-config print the commented example configuration
   -V, --version              print version information
   -h, --help                 print this help
@@ -102,6 +114,9 @@ Running (default action only):
 
 Command-line values override the file for the whole life of the process,
 including after a reload (SIGHUP or file change).
+
+Signals of the daemon: SIGHUP reload, SIGUSR1 write the status file, SIGUSR2 purge
+expired files, SIGTERM/SIGINT unmount and exit.
 
 Exit codes: 0 success, 1 runtime error, 2 usage error, 3 privileges,
             4 missing dependency, 5 invalid configuration, 7 unexpected system state.
@@ -134,6 +149,9 @@ Result<CliOptions> parse_command_line(int argc, char** argv) {
         {"no-stack-trace", no_argument, nullptr, kNoStackTrace},
         {"core-dump", no_argument, nullptr, kCoreDump},
         {"no-core-dump", no_argument, nullptr, kNoCoreDump},
+        {"purge", no_argument, nullptr, kPurge},
+        {"force", no_argument, nullptr, kForce},
+        {"stats", no_argument, nullptr, kStats},
         {nullptr, 0, nullptr, 0},
     };
     CliOptions options;
@@ -183,7 +201,23 @@ Result<CliOptions> parse_command_line(int argc, char** argv) {
             case 'h': ok = set_action(CliAction::help); break;
             case kCheckConfig: ok = set_action(CliAction::check_config); break;
             case kShowConfig: ok = set_action(CliAction::show_config); break;
-            case kDryRun: ok = set_action(CliAction::dry_run); break;
+            case kDryRun:
+                if (action == CliAction::purge) {
+                    options.purge_preview = true;  // --purge --dry-run: preview.
+                } else {
+                    ok = set_action(CliAction::dry_run);
+                }
+                break;
+            case kPurge:
+                if (action == CliAction::dry_run) {
+                    action = CliAction::purge;  // --dry-run --purge: preview.
+                    options.purge_preview = true;
+                } else {
+                    ok = set_action(CliAction::purge);
+                }
+                break;
+            case kForce: options.force = true; break;
+            case kStats: ok = set_action(CliAction::stats); break;
             case kStatus: ok = set_action(CliAction::status); break;
             case kPrintExample: ok = set_action(CliAction::print_example_config); break;
             case kFuseDebug:
@@ -220,6 +254,9 @@ Result<CliOptions> parse_command_line(int argc, char** argv) {
         return usage(std::format("unexpected argument '{}'", argv[::optind]));
     }
     options.action = action.value_or(CliAction::run);
+    if (options.force && (options.action != CliAction::purge || options.purge_preview)) {
+        return usage("--force only applies to --purge (without --dry-run)");
+    }
     if (options.action != CliAction::run && run_only_option) {
         return usage(
             std::format("--foreground, --debug, --fuse-debug and the diagnostics options only apply when "
